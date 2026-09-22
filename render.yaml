@@ -1,0 +1,21 @@
+services:
+  - type: web
+    name: ags-backend
+    runtime: node
+    plan: free
+    buildCommand: npm ci --include=dev && npm run build && npm prune --omit=dev
+    startCommand: npm start
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: TRUST_PROXY_HOPS
+        value: "1"
+      - key: DATABASE_URL
+        sync: false
+      - key: MICROSOFT_TENANT_ID
+        sync: false
+      - key: FRONTEND_ORIGINS
+        sync: false
+      - key: SUPPORT_ADMIN_USER_IDS
+        value: ""

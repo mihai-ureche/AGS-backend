@@ -1,0 +1,34 @@
+{
+  "name": "ags-backend",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Microsoft work account support request API",
+  "engines": {
+    "node": ">=24 <27"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json && cp src/schema.sql dist/schema.sql",
+    "start": "node --enable-source-maps --env-file-if-exists=.env dist/server.js",
+    "dev": "tsx watch --env-file-if-exists=.env src/server.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "node --import tsx --test test/*.test.ts"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^5.1.0",
+    "express-rate-limit": "^8.0.1",
+    "helmet": "^8.1.0",
+    "pg": "^8.16.3"
+  },
+  "devDependencies": {
+    "@types/cors": "^2.8.19",
+    "@types/express": "^5.0.6",
+    "@types/node": "^24.13.6",
+    "@types/pg": "^8.23.1",
+    "@types/supertest": "^7.2.1",
+    "supertest": "^7.1.4",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2"
+  }
+}
