@@ -17,5 +17,3 @@ services:
         sync: false
       - key: FRONTEND_ORIGINS
         sync: false
-      - key: SUPPORT_ADMIN_USER_IDS
-        value: ""

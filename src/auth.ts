@@ -48,7 +48,8 @@ export function createAuthenticate(config: AppConfig, fetchGraph: GraphFetch = f
       tenantId,
       displayName: typeof profile.displayName === 'string' ? profile.displayName : null,
       email: typeof profile.mail === 'string' ? profile.mail : typeof profile.userPrincipalName === 'string' ? profile.userPrincipalName : null,
-      isAdmin: config.adminUserIds.includes(id),
+      isAdmin: false,
+      role: 'user',
     };
     next();
   };

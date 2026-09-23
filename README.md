@@ -76,8 +76,11 @@ Every `/api/*` request requires `Authorization: Bearer YOUR_GRAPH_ACCESS_TOKEN`.
 | Method | Path | Result |
 | --- | --- | --- |
 | GET | `/health` | Public database health check; `200` healthy, `503` unavailable |
-| GET | `/api/me` | `{ user: { id, tenantId, displayName, email, isAdmin } }` |
+| GET | `/api/me` | `{ user: { id, tenantId, displayName, email, role, isAdmin, permissions } }` |
 | POST | `/api/users` | Create or refresh your database user from Microsoft; returns `200` and `{ user }` |
+| GET | `/api/users` | Admin only: list users in your organization with `limit` and `offset` |
+| GET | `/api/roles` | Admin only: available roles and their permissions |
+| PATCH | `/api/users/:id/role` | Admin only: assign `{ "role": "user\|support\|admin" }` using the database user ID |
 | POST | `/api/requests` | Create a request; returns `201` and `{ request }` |
 | GET | `/api/requests` | List your requests; staff see all requests in the tenant |
 | GET | `/api/requests/:id` | Retrieve your request; staff can retrieve any in the tenant |
@@ -85,7 +88,7 @@ Every `/api/*` request requires `Authorization: Bearer YOUR_GRAPH_ACCESS_TOKEN`.
 
 Create requires `title` (1–200 characters) and `description` (1–10,000 characters). Optional `priority` is `low`, `normal` (default), or `high`. New requests start as `open`. Unknown body fields are rejected, including attempts to set an owner or staff role.
 
-Statuses: `open`, `in_progress`, `resolved`, `closed`. Staff can move between any statuses, including reopening. Add staff members' **user object IDs** (not application IDs or email addresses) to `SUPPORT_ADMIN_USER_IDS`. Staff must still authenticate in the configured tenant. Without this setting, everyone is a regular user.
+Statuses: `open`, `in_progress`, `resolved`, `closed`. Users with the `support` or `admin` role can move requests between any statuses, including reopening, within their organization.
 
 List filters: `?status=open&limit=20&offset=0`. Limit defaults to 20, maximum 100; offset defaults to 0, maximum 1,000,000. Results are newest first and return `{ requests, limit, offset }`. Regular users receive `404` when requesting another user's request.
 
@@ -109,13 +112,56 @@ async function createUser(accessToken: string) {
 const user = await createUser(result.accessToken);
 ```
 
-The response contains `id` (the database user UUID), `microsoftUserId`, `tenantId`, `displayName`, `email`, `createdAt`, `updatedAt`, and `lastSeenAt`. Timestamps are ISO strings; name and email can be null. The database `id` is distinct from the Microsoft ID returned by `/api/me` and used for request ownership.
+The response contains `id` (the database user UUID), `microsoftUserId`, `tenantId`, `displayName`, `email`, `role`, `createdAt`, `updatedAt`, and `lastSeenAt`. Timestamps are ISO strings; name and email can be null. The database `id` is distinct from the Microsoft ID returned by `/api/me` and used for request ownership.
 
 The backend verifies the Microsoft profile and organization before writing. A unique `(tenant_id, microsoft_user_id)` constraint makes repeat and concurrent calls safe: existing users keep their database ID and creation timestamp while their profile, update timestamp, and last-seen timestamp are refreshed. No password or token is stored. `lastSeenAt` records the last successful call to this endpoint.
 
 Restart the backend after updating: startup creates the `users` table if absent. Row-level security is enabled without public policies so profile access goes through this backend. Its database connection must use the table owner or a role with `BYPASSRLS`, as the current Supabase `postgres` connection does.
 
-This endpoint saves profiles only. Staff permissions continue to come from `SUPPORT_ADMIN_USER_IDS`; database role management is not implemented by this endpoint.
+### Roles and permissions
+
+The `roles` table contains three built-in roles, referenced by `users.role`:
+
+| Role | Permissions |
+| --- | --- |
+| `user` | Create requests and view their own requests |
+| `support` | User permissions plus view and update all requests in their organization |
+| `admin` | Support permissions plus list users/roles and assign roles in their organization |
+
+Startup adds the role column to existing installations and gives existing and new users the `user` role. Assigned roles survive both restarts and profile refreshes. Permissions are defined in `src/permissions.ts`; changing a role description does not change its permissions. Additional roles require an intentional schema and code update.
+
+After Microsoft authentication, the backend reads the role from PostgreSQL on every request. Accounts without a saved profile have only `user` access. Database lookup failures deny access rather than trusting frontend data. `/api/me` returns `role`, `permissions`, and `isAdmin` (true only for `admin`). Use permission strings such as `requests:update` to show frontend controls; backend route checks and organization/ownership filters enforce access independently.
+
+To assign the first administrator:
+
+1. Start the updated backend once to initialize the role schema.
+2. Sign in and call `POST /api/users`; copy `user.id` from the response (the internal database UUID).
+3. Run this operator command locally with your database and tenant configured in `.env`:
+
+```sh
+npm run user:role -- YOUR_DATABASE_USER_UUID admin
+```
+
+The command only updates an existing user within `MICROSOFT_TENANT_ID`. It requires database credentials and is intended for initial setup or recovery. In a production installation without development dependencies, the equivalent after building is `node --env-file-if-exists=.env dist/set-user-role.js YOUR_DATABASE_USER_UUID admin`.
+
+**Upgrade from environment-based staff access:** `SUPPORT_ADMIN_USER_IDS` is no longer used. Assign those existing staff accounts the `support` role using the operator command or an administrator. The new schema defaults everyone to `user`; no account is automatically promoted to administrator.
+
+Once an administrator exists, use their Microsoft Graph token to assign roles:
+
+```ts
+const response = await fetch(`${API_URL}/api/users/${databaseUserId}/role`, {
+  method: 'PATCH',
+  headers: {
+    Authorization: `Bearer ${result.accessToken}`,
+    'Content-Type': 'application/json',
+  },
+  body: JSON.stringify({ role: 'support' }),
+});
+const data = await response.json();
+if (!response.ok) throw new Error(data.error);
+```
+
+The endpoint returns `200` with `{ user }`. Non-admins receive `403`; unknown roles or unsupported fields return `400`; missing or cross-organization targets return `404`. Administrators cannot demote their own account (`409`); the operator command supports recovery. Role changes take effect on the next API request without signing in again. Public Supabase Data API access to `roles` and `users` is blocked by row-level security without public policies; assignments go through this backend or a trusted database operator.
 
 ## Deploy on Render
 
@@ -130,7 +176,6 @@ This endpoint saves profiles only. Staff permissions continue to come from `SUPP
 | `DATABASE_URL` | Render Postgres **internal** database URL for the same region/workspace |
 | `MICROSOFT_TENANT_ID` | Your directory's tenant UUID |
 | `FRONTEND_ORIGINS` | Exact frontend origin, e.g. `https://help.example.com`; comma-separated for multiple origins, no trailing slash |
-| `SUPPORT_ADMIN_USER_IDS` | Optional comma-separated support staff user object UUIDs |
 | `TRUST_PROXY_HOPS` | `1` behind Render's proxy; `0` locally; match your actual proxy topology |
 | `PORT` | Provided by Render; defaults to `3000` locally |
 

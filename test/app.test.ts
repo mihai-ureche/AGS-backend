@@ -3,12 +3,12 @@ import assert from 'node:assert/strict';
 import request from 'supertest';
 import { createApp } from '../src/app.js';
 import { readConfig } from '../src/config.js';
-import type { AppConfig, AuthenticatedUser, CreateRequestInput, GraphFetch, RequestPage, Store, SupportRequest } from '../src/types.js';
+import type { AppConfig, AuthenticatedUser, CreateRequestInput, GraphFetch, RequestPage, Role, Store, SupportRequest } from '../src/types.js';
 
 const tenantId = '11111111-1111-1111-1111-111111111111';
 const userId = '22222222-2222-2222-2222-222222222222';
 const requestId = '33333333-3333-3333-3333-333333333333';
-const config: AppConfig = { tenantId, adminUserIds: [], origins: ['https://frontend.example'], trustProxyHops: 0, port: 3000, databaseUrl: 'postgresql://localhost/ags_test' };
+const config: AppConfig = { tenantId, origins: ['https://frontend.example'], trustProxyHops: 0, port: 3000, databaseUrl: 'postgresql://localhost/ags_test' };
 
 interface SetupOptions {
   config?: Partial<AppConfig>;
@@ -16,6 +16,7 @@ interface SetupOptions {
   fetchGraph?: GraphFetch;
   tenantId?: string;
   rateLimitMax?: number;
+  role?: Role;
 }
 
 const storedRequest: SupportRequest = {
@@ -28,11 +29,15 @@ function setup(options: SetupOptions = {}) {
   const calls: { user: AuthenticatedUser; input?: CreateRequestInput; page?: RequestPage }[] = [];
   const store: Store = {
     health: async () => {},
+    getUserRole: async () => options.role ?? 'user',
+    listRoles: async () => [{ name: 'user', description: 'Own requests' }],
+    listUsers: async () => [],
+    updateUserRole: async () => undefined,
     createUser: async user => {
       calls.push({ user });
       return {
         id: requestId, microsoftUserId: user.id, tenantId: user.tenantId,
-        displayName: user.displayName, email: user.email,
+        displayName: user.displayName, email: user.email, role: options.role ?? 'user',
         createdAt: storedRequest.createdAt, updatedAt: storedRequest.updatedAt,
         lastSeenAt: storedRequest.updatedAt,
       };
@@ -67,7 +72,7 @@ test('createUser saves the verified Microsoft profile with no body or an empty o
   assert.equal(first.headers['cache-control'], 'no-store');
   assert.equal(calls.length, 2);
   assert.deepEqual(calls[0]?.user, {
-    id: userId, tenantId, displayName: 'Test User', email: 'user@example.com', isAdmin: false,
+    id: userId, tenantId, displayName: 'Test User', email: 'user@example.com', isAdmin: false, role: 'user',
   });
   assert.ok(!first.text.includes('opaque-graph-token'));
 });
@@ -117,7 +122,7 @@ test('missing and malformed tokens never reach Graph', async () => {
 test('opaque tokens work through Graph with verified identity', async () => {
   const { client, graphCalls } = setup();
   const { body, headers } = await client.get('/api/me').set(...bearer).expect(200);
-  assert.deepEqual(body.user, { id: userId, tenantId, displayName: 'Test User', email: 'user@example.com', isAdmin: false });
+  assert.deepEqual(body.user, { id: userId, tenantId, displayName: 'Test User', email: 'user@example.com', isAdmin: false, role: 'user', permissions: ['requests:create', 'requests:read:own'] });
   assert.equal(headers['cache-control'], 'no-store');
   assert.equal(graphCalls.length, 2);
   for (const call of graphCalls) {
@@ -183,9 +188,9 @@ test('missing requests are 404; malformed IDs are 400', async () => {
   await client.get('/api/requests/not-a-uuid').set(...bearer).expect(400);
 });
 
-test('only configured staff can update status', async () => {
+test('support can update status', async () => {
   await setup().client.patch(`/api/requests/${requestId}`).set(...bearer).send({ status: 'resolved' }).expect(403);
-  const { client } = setup({ config: { adminUserIds: [userId] } });
+  const { client } = setup({ role: 'support' });
   const result = await client.patch(`/api/requests/${requestId}`).set(...bearer).send({ status: 'resolved' }).expect(200);
   assert.equal(result.body.request.id, requestId);
   assert.equal(result.body.request.status, 'resolved');
@@ -216,5 +221,97 @@ test('configuration rejects missing tenant and invalid origins', () => {
   assert.throws(() => readConfig({ ...env, MICROSOFT_TENANT_ID: '' }));
   assert.throws(() => readConfig({ ...env, FRONTEND_ORIGINS: '*' }));
   assert.throws(() => readConfig({ ...env, FRONTEND_ORIGINS: 'https://frontend.example/path' }));
-  assert.throws(() => readConfig({ ...env, SUPPORT_ADMIN_USER_IDS: 'email@example.com' }));
+});
+
+test('me reports the current database role and permissions on every request', async () => {
+  let role: Role = 'support';
+  const { client } = setup({ store: { getUserRole: async () => role } });
+  const support = await client.get('/api/me').set(...bearer).expect(200);
+  assert.equal(support.body.user.role, 'support');
+  assert.equal(support.body.user.isAdmin, false);
+  assert.ok(support.body.user.permissions.includes('requests:update'));
+  await client.patch(`/api/requests/${requestId}`).set(...bearer).send({ status: 'resolved' }).expect(200);
+  role = 'user';
+  await client.patch(`/api/requests/${requestId}`).set(...bearer).send({ status: 'resolved' }).expect(403);
+  role = 'admin';
+  const admin = await client.get('/api/me').set(...bearer).expect(200);
+  assert.equal(admin.body.user.isAdmin, true);
+  assert.ok(admin.body.user.permissions.includes('users:roles:update'));
+});
+
+test('missing users have basic access; invalid roles and database failures fail closed', async () => {
+  const missing = setup({ store: { getUserRole: async () => undefined } });
+  const { body } = await missing.client.get('/api/me').set(...bearer).expect(200);
+  assert.equal(body.user.role, 'user');
+  await missing.client.get('/api/users').set(...bearer).expect(403);
+  const invalid = setup({ store: { getUserRole: async () => 'superuser' as Role } });
+  await invalid.client.get('/api/me').set(...bearer).expect(403);
+  const failure = setup({ store: { getUserRole: async () => { throw Error('private database error'); } } });
+  await failure.client.patch(`/api/requests/${requestId}`).set(...bearer).send({ status: 'resolved' }).expect(500);
+});
+
+test('only admins can list users, view roles, or assign roles', async () => {
+  for (const role of ['user', 'support'] as const) {
+    const { client } = setup({ role, store: {
+      listUsers: async () => { assert.fail('Unauthorized user listing'); },
+      listRoles: async () => { assert.fail('Unauthorized role listing'); },
+      updateUserRole: async () => { assert.fail('Unauthorized role assignment'); },
+    } });
+    await client.get('/api/users').set(...bearer).expect(403);
+    await client.get('/api/roles').set(...bearer).expect(403);
+    await client.patch(`/api/users/${requestId}/role`).set(...bearer).send({ role: 'admin' }).expect(403);
+  }
+});
+
+test('admin user listing validates pagination and passes verified organization', async () => {
+  let count = 0;
+  const { client } = setup({ role: 'admin', store: {
+    listUsers: async (user, page) => {
+      count++;
+      assert.equal(user.tenantId, tenantId);
+      assert.equal(user.role, 'admin');
+      assert.deepEqual(page, { limit: 5, offset: 10 });
+      return [];
+    },
+  } });
+  await client.get('/api/users?limit=5&offset=10').set(...bearer).expect(200, { users: [], limit: 5, offset: 10 });
+  for (const query of ['limit=0', 'limit=101', 'offset=-1', 'offset=1000001']) {
+    await client.get(`/api/users?${query}`).set(...bearer).expect(400);
+  }
+  assert.equal(count, 1);
+  const { body } = await client.get('/api/roles').set(...bearer).expect(200);
+  assert.deepEqual(body.roles[0].permissions, ['requests:create', 'requests:read:own']);
+});
+
+test('admin role assignment validates inputs and returns the saved role', async () => {
+  let count = 0;
+  const { client } = setup({ role: 'admin', store: {
+    updateUserRole: async (actor, id, role) => {
+      count++;
+      assert.equal(actor.id, userId);
+      assert.equal(actor.tenantId, tenantId);
+      assert.equal(id, requestId);
+      return {
+        id, microsoftUserId: '44444444-4444-4444-4444-444444444444', tenantId,
+        displayName: 'Other user', email: null, role,
+        createdAt: storedRequest.createdAt, updatedAt: storedRequest.updatedAt, lastSeenAt: storedRequest.updatedAt,
+      };
+    },
+  } });
+  for (const role of ['user', 'support', 'admin']) {
+    const { body } = await client.patch(`/api/users/${requestId}/role`).set(...bearer).send({ role }).expect(200);
+    assert.equal(body.user.role, role);
+  }
+  for (const body of [{}, { role: 'owner' }, { role: null }, { role: 'admin', tenantId }, []]) {
+    await client.patch(`/api/users/${requestId}/role`).set(...bearer).send(body).expect(400);
+  }
+  await client.patch('/api/users/not-a-uuid/role').set(...bearer).send({ role: 'user' }).expect(400);
+  assert.equal(count, 3);
+  await setup({ role: 'admin' }).client.patch(`/api/users/${requestId}/role`).set(...bearer).send({ role: 'user' }).expect(404);
+});
+
+test('role lookup never runs for invalid or foreign Microsoft identities', async () => {
+  const store = { getUserRole: async () => { assert.fail('Unverified identity reached the database'); } };
+  await setup({ store }).client.get('/api/roles').expect(401);
+  await setup({ store, tenantId: requestId }).client.get('/api/roles').set(...bearer).expect(403);
 });

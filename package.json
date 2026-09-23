@@ -12,6 +12,7 @@
     "start": "node --enable-source-maps --env-file-if-exists=.env dist/server.js",
     "dev": "tsx watch --env-file-if-exists=.env src/server.ts",
     "typecheck": "tsc --noEmit",
+    "user:role": "tsx --env-file-if-exists=.env src/set-user-role.ts",
     "test": "node --import tsx --test test/*.test.ts"
   },
   "dependencies": {

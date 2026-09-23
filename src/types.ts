@@ -2,7 +2,6 @@ export interface AppConfig {
   tenantId: string;
   databaseUrl: string;
   origins: string[];
-  adminUserIds: string[];
   port: number;
   trustProxyHops: number;
 }
@@ -13,6 +12,13 @@ export interface AuthenticatedUser {
   displayName: string | null;
   email: string | null;
   isAdmin: boolean;
+  role: Role;
+}
+
+export type Role = 'user' | 'support' | 'admin';
+export interface StoredRole {
+  name: Role;
+  description: string;
 }
 
 export interface StoredUser {
@@ -21,6 +27,7 @@ export interface StoredUser {
   microsoftUserId: string;
   displayName: string | null;
   email: string | null;
+  role: Role;
   createdAt: Date;
   updatedAt: Date;
   lastSeenAt: Date;
@@ -53,6 +60,10 @@ export interface RequestPage {
 
 export interface Store {
   health(): Promise<void>;
+  getUserRole(user: AuthenticatedUser): Promise<Role | undefined>;
+  listRoles(): Promise<StoredRole[]>;
+  listUsers(user: AuthenticatedUser, page: Pick<RequestPage, 'limit' | 'offset'>): Promise<StoredUser[]>;
+  updateUserRole(user: AuthenticatedUser, id: string, role: Role): Promise<StoredUser | undefined>;
   createUser(user: AuthenticatedUser): Promise<StoredUser>;
   create(user: AuthenticatedUser, input: CreateRequestInput): Promise<SupportRequest>;
   list(user: AuthenticatedUser, page: RequestPage): Promise<SupportRequest[]>;

@@ -8,6 +8,7 @@ import { UUID } from './config.js';
 import { HttpError } from './errors.js';
 import type { AppConfig, GraphFetch, Store } from './types.js';
 import { isRecord, isRequestPriority, isRequestStatus } from './validation.js';
+import { isRole, permissionsFor, requirePermission } from './permissions.js';
 
 interface AppOptions {
   config: AppConfig;
@@ -70,8 +71,37 @@ export function createApp({ config, store, fetchGraph, rateLimitMax = 120 }: App
     message: { error: 'Too many requests. Try again shortly.' },
   }));
   api.use(createAuthenticate(config, fetchGraph));
+  api.use(async (req, res, next) => {
+    const user = authenticatedUser(req);
+    const role = (await store.getUserRole(user)) ?? 'user';
+    if (!isRole(role)) throw new HttpError(403, 'Your account has an unsupported role.');
+    user.role = role;
+    user.isAdmin = role === 'admin';
+    next();
+  });
   api.use(express.json({ limit: '32kb' }));
-  api.get('/me', (req, res) => res.json({ user: authenticatedUser(req) }));
+  api.get('/me', (req, res) => {
+    const user = authenticatedUser(req);
+    res.json({ user: { ...user, permissions: permissionsFor(user.role) } });
+  });
+  api.get('/roles', requirePermission('roles:read'), async (req, res) => {
+    const roles = await store.listRoles();
+    res.json({ roles: roles.map(role => ({ ...role, permissions: permissionsFor(role.name) })) });
+  });
+  api.get('/users', requirePermission('users:read'), async (req, res) => {
+    const limit = pageNumber(req.query.limit, 20, 100, 1);
+    const offset = pageNumber(req.query.offset, 0, 1000000);
+    const users = await store.listUsers(authenticatedUser(req), { limit, offset });
+    res.json({ users, limit, offset });
+  });
+  api.patch<{ id: string }>('/users/:id/role', requirePermission('users:roles:update'), async (req, res) => {
+    const body: unknown = req.body;
+    bodyFields(body, ['role']);
+    if (!isRole(body.role)) throw new HttpError(400, 'role must be user, support, or admin.');
+    const user = await store.updateUserRole(authenticatedUser(req), req.params.id, body.role);
+    if (!user) throw new HttpError(404, 'User not found or administrator access was revoked.');
+    res.json({ user });
+  });
   api.post('/users', async (req, res) => {
     // The bearer token is the only source of identity; no profile or role input.
     const body: unknown = req.body;
@@ -79,7 +109,7 @@ export function createApp({ config, store, fetchGraph, rateLimitMax = 120 }: App
     const user = await store.createUser(authenticatedUser(req));
     res.json({ user });
   });
-  api.post('/requests', async (req, res) => {
+  api.post('/requests', requirePermission('requests:create'), async (req, res) => {
     const body: unknown = req.body;
     bodyFields(body, ['title', 'description', 'priority']);
     const title = textField(body.title, 'title', 200);
@@ -89,7 +119,7 @@ export function createApp({ config, store, fetchGraph, rateLimitMax = 120 }: App
     const request = await store.create(authenticatedUser(req), { title, description, priority });
     res.status(201).location(`/api/requests/${request.id}`).json({ request });
   });
-  api.get('/requests', async (req, res) => {
+  api.get('/requests', requirePermission('requests:read:own'), async (req, res) => {
     const { status } = req.query;
     if (status !== undefined && !isRequestStatus(status)) throw new HttpError(400, 'Invalid status filter.');
     const limit = pageNumber(req.query.limit, 20, 100, 1);
@@ -101,14 +131,13 @@ export function createApp({ config, store, fetchGraph, rateLimitMax = 120 }: App
     if (typeof id !== 'string' || !UUID.test(id)) throw new HttpError(400, 'Request ID must be a UUID.');
     next();
   });
-  api.get('/requests/:id', async (req, res) => {
+  api.get<{ id: string }>('/requests/:id', requirePermission('requests:read:own'), async (req, res) => {
     const request = await store.get(authenticatedUser(req), req.params.id);
     if (!request) throw new HttpError(404, 'Support request not found.');
     res.json({ request });
   });
-  api.patch('/requests/:id', async (req, res) => {
+  api.patch<{ id: string }>('/requests/:id', requirePermission('requests:update'), async (req, res) => {
     const user = authenticatedUser(req);
-    if (!user.isAdmin) throw new HttpError(403, 'Only support staff can change request status.');
     const body: unknown = req.body;
     bodyFields(body, ['status']);
     if (!isRequestStatus(body.status)) throw new HttpError(400, 'status must be open, in_progress, resolved, or closed.');
