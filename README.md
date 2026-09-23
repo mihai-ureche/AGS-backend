@@ -77,6 +77,7 @@ Every `/api/*` request requires `Authorization: Bearer YOUR_GRAPH_ACCESS_TOKEN`.
 | --- | --- | --- |
 | GET | `/health` | Public database health check; `200` healthy, `503` unavailable |
 | GET | `/api/me` | `{ user: { id, tenantId, displayName, email, isAdmin } }` |
+| POST | `/api/users` | Create or refresh your database user from Microsoft; returns `200` and `{ user }` |
 | POST | `/api/requests` | Create a request; returns `201` and `{ request }` |
 | GET | `/api/requests` | List your requests; staff see all requests in the tenant |
 | GET | `/api/requests/:id` | Retrieve your request; staff can retrieve any in the tenant |
@@ -89,6 +90,32 @@ Statuses: `open`, `in_progress`, `resolved`, `closed`. Staff can move between an
 List filters: `?status=open&limit=20&offset=0`. Limit defaults to 20, maximum 100; offset defaults to 0, maximum 1,000,000. Results are newest first and return `{ requests, limit, offset }`. Regular users receive `404` when requesting another user's request.
 
 A request has `id`, `title`, `description`, `priority`, `status`, `ownerId`, `ownerName`, `ownerEmail`, `createdAt`, and `updatedAt`. Errors use `{ "error": "message" }` with an appropriate HTTP status. The API allows 120 requests per minute per IP per running instance; adjust for shared office networks or multiple instances. Attachments, comments, notifications, and deletion are outside this starter's scope.
+
+### Save the signed-in user
+
+Call `POST /api/users` after Microsoft sign-in with a Microsoft Graph access token for delegated `User.Read`, using the same token acquisition shown above. No request body is needed; an empty JSON object is also accepted. Profile, identity, and role fields in a JSON body are rejected.
+
+```ts
+async function createUser(accessToken: string) {
+  const response = await fetch('https://YOUR-SERVICE.onrender.com/api/users', {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${accessToken}` },
+  });
+  const data = await response.json();
+  if (!response.ok) throw new Error(data.error);
+  return data.user;
+}
+
+const user = await createUser(result.accessToken);
+```
+
+The response contains `id` (the database user UUID), `microsoftUserId`, `tenantId`, `displayName`, `email`, `createdAt`, `updatedAt`, and `lastSeenAt`. Timestamps are ISO strings; name and email can be null. The database `id` is distinct from the Microsoft ID returned by `/api/me` and used for request ownership.
+
+The backend verifies the Microsoft profile and organization before writing. A unique `(tenant_id, microsoft_user_id)` constraint makes repeat and concurrent calls safe: existing users keep their database ID and creation timestamp while their profile, update timestamp, and last-seen timestamp are refreshed. No password or token is stored. `lastSeenAt` records the last successful call to this endpoint.
+
+Restart the backend after updating: startup creates the `users` table if absent. Row-level security is enabled without public policies so profile access goes through this backend. Its database connection must use the table owner or a role with `BYPASSRLS`, as the current Supabase `postgres` connection does.
+
+This endpoint saves profiles only. Staff permissions continue to come from `SUPPORT_ADMIN_USER_IDS`; database role management is not implemented by this endpoint.
 
 ## Deploy on Render
 

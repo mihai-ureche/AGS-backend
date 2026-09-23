@@ -72,6 +72,13 @@ export function createApp({ config, store, fetchGraph, rateLimitMax = 120 }: App
   api.use(createAuthenticate(config, fetchGraph));
   api.use(express.json({ limit: '32kb' }));
   api.get('/me', (req, res) => res.json({ user: authenticatedUser(req) }));
+  api.post('/users', async (req, res) => {
+    // The bearer token is the only source of identity; no profile or role input.
+    const body: unknown = req.body;
+    if (body !== undefined) bodyFields(body, []);
+    const user = await store.createUser(authenticatedUser(req));
+    res.json({ user });
+  });
   api.post('/requests', async (req, res) => {
     const body: unknown = req.body;
     bodyFields(body, ['title', 'description', 'priority']);

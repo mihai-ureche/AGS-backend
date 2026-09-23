@@ -15,6 +15,17 @@ export interface AuthenticatedUser {
   isAdmin: boolean;
 }
 
+export interface StoredUser {
+  id: string;
+  tenantId: string;
+  microsoftUserId: string;
+  displayName: string | null;
+  email: string | null;
+  createdAt: Date;
+  updatedAt: Date;
+  lastSeenAt: Date;
+}
+
 export type RequestStatus = 'open' | 'in_progress' | 'resolved' | 'closed';
 export type RequestPriority = 'low' | 'normal' | 'high';
 
@@ -42,6 +53,7 @@ export interface RequestPage {
 
 export interface Store {
   health(): Promise<void>;
+  createUser(user: AuthenticatedUser): Promise<StoredUser>;
   create(user: AuthenticatedUser, input: CreateRequestInput): Promise<SupportRequest>;
   list(user: AuthenticatedUser, page: RequestPage): Promise<SupportRequest[]>;
   get(user: AuthenticatedUser, id: string): Promise<SupportRequest | undefined>;

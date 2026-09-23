@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import type { Pool } from 'pg';
-import type { Store, SupportRequest } from './types.js';
+import type { Store, StoredUser, SupportRequest } from './types.js';
 
 const fields = `id, title, description, priority, status,
   owner_id AS "ownerId", owner_name AS "ownerName", owner_email AS "ownerEmail",
@@ -9,6 +9,23 @@ const fields = `id, title, description, priority, status,
 export function createStore(pool: Pool): Store {
   return {
     async health() { await pool.query('SELECT 1'); },
+    async createUser(user) {
+      const { rows } = await pool.query<StoredUser>(`INSERT INTO users
+        (id, tenant_id, microsoft_user_id, display_name, email)
+        VALUES ($1, $2, $3, $4, $5)
+        ON CONFLICT (tenant_id, microsoft_user_id) DO UPDATE SET
+          display_name = EXCLUDED.display_name,
+          email = EXCLUDED.email,
+          updated_at = NOW(),
+          last_seen_at = NOW()
+        RETURNING id, tenant_id AS "tenantId", microsoft_user_id AS "microsoftUserId",
+          display_name AS "displayName", email, created_at AS "createdAt",
+          updated_at AS "updatedAt", last_seen_at AS "lastSeenAt"`,
+      [randomUUID(), user.tenantId, user.id, user.displayName, user.email]);
+      const saved = rows[0];
+      if (!saved) throw new Error('Database did not return the saved user.');
+      return saved;
+    },
     async create(user, input) {
       const { rows } = await pool.query<SupportRequest>(`INSERT INTO support_requests
         (id, tenant_id, owner_id, owner_name, owner_email, title, description, priority)

@@ -28,6 +28,15 @@ function setup(options: SetupOptions = {}) {
   const calls: { user: AuthenticatedUser; input?: CreateRequestInput; page?: RequestPage }[] = [];
   const store: Store = {
     health: async () => {},
+    createUser: async user => {
+      calls.push({ user });
+      return {
+        id: requestId, microsoftUserId: user.id, tenantId: user.tenantId,
+        displayName: user.displayName, email: user.email,
+        createdAt: storedRequest.createdAt, updatedAt: storedRequest.updatedAt,
+        lastSeenAt: storedRequest.updatedAt,
+      };
+    },
     create: async (user, input) => { calls.push({ user, input }); return { ...storedRequest, ...input }; },
     list: async (user, page) => { calls.push({ user, page }); return []; },
     get: async () => undefined,
@@ -45,6 +54,49 @@ function setup(options: SetupOptions = {}) {
   return { client: request(app), calls, graphCalls };
 }
 const bearer = ['Authorization', 'Bearer opaque-graph-token'] as const;
+
+test('createUser saves the verified Microsoft profile with no body or an empty object', async () => {
+  const { client, calls } = setup();
+  const first = await client.post('/api/users').set(...bearer).expect(200);
+  const repeated = await client.post('/api/users').set(...bearer).send({}).expect(200);
+  assert.deepEqual(first.body, repeated.body);
+  assert.equal(first.body.user.id, requestId);
+  assert.equal(first.body.user.microsoftUserId, userId);
+  assert.equal(first.body.user.tenantId, tenantId);
+  assert.equal(first.body.user.email, 'user@example.com');
+  assert.equal(first.headers['cache-control'], 'no-store');
+  assert.equal(calls.length, 2);
+  assert.deepEqual(calls[0]?.user, {
+    id: userId, tenantId, displayName: 'Test User', email: 'user@example.com', isAdmin: false,
+  });
+  assert.ok(!first.text.includes('opaque-graph-token'));
+});
+
+test('createUser rejects client-supplied identity and privilege fields before saving', async () => {
+  const { client, calls } = setup();
+  for (const body of [{ id: requestId }, { tenantId: requestId }, { email: 'other@example.com' },
+    { displayName: 'Other' }, { role: 'admin' }, { isAdmin: true }, { token: 'token' }, []]) {
+    await client.post('/api/users').set(...bearer).send(body).expect(400);
+  }
+  assert.equal(calls.length, 0);
+});
+
+test('createUser requires valid authentication and the configured organization', async () => {
+  const missing = setup();
+  await missing.client.post('/api/users').expect(401);
+  assert.equal(missing.calls.length, 0);
+  const invalid = setup({ fetchGraph: async () => new Response(null, { status: 401 }) });
+  await invalid.client.post('/api/users').set(...bearer).expect(401);
+  assert.equal(invalid.calls.length, 0);
+  const foreign = setup({ tenantId: requestId });
+  await foreign.client.post('/api/users').set(...bearer).expect(403);
+  assert.equal(foreign.calls.length, 0);
+});
+
+test('createUser does not expose database errors', async () => {
+  const { client } = setup({ store: { createUser: async () => { throw Error('private database details'); } } });
+  await client.post('/api/users').set(...bearer).expect(500, { error: 'An unexpected server error occurred.' });
+});
 
 test('health checks database without authentication', async () => {
   const { client, graphCalls } = setup();

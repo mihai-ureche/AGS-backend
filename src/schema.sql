@@ -1,3 +1,17 @@
+CREATE TABLE IF NOT EXISTS users (
+  id UUID PRIMARY KEY,
+  tenant_id UUID NOT NULL,
+  microsoft_user_id UUID NOT NULL,
+  display_name TEXT,
+  email TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  UNIQUE (tenant_id, microsoft_user_id)
+);
+-- Access goes through the authenticated backend, not the Supabase public Data API.
+ALTER TABLE users ENABLE ROW LEVEL SECURITY;
+
 CREATE TABLE IF NOT EXISTS support_requests (
   id UUID PRIMARY KEY,
   tenant_id UUID NOT NULL,
