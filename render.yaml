@@ -17,3 +17,5 @@ services:
         sync: false
       - key: FRONTEND_ORIGINS
         sync: false
+      - key: BORG_API_AUTHORIZATION
+        sync: false

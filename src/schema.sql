@@ -1,5 +1,5 @@
 CREATE TABLE IF NOT EXISTS roles (
-  name TEXT PRIMARY KEY CHECK (name IN ('user', 'support', 'admin')),
+  name TEXT PRIMARY KEY,
   description TEXT NOT NULL
 );
 INSERT INTO roles (name, description) VALUES
@@ -8,6 +8,15 @@ INSERT INTO roles (name, description) VALUES
   ('admin', 'Support access plus user and role management within the organization')
 ON CONFLICT (name) DO NOTHING;
 ALTER TABLE roles ENABLE ROW LEVEL SECURITY;
+-- Upgrade the former fixed-role schema without changing existing assignments.
+ALTER TABLE roles DROP CONSTRAINT IF EXISTS roles_name_check;
+ALTER TABLE roles ADD COLUMN IF NOT EXISTS permissions TEXT[] NOT NULL DEFAULT '{}';
+UPDATE roles SET permissions = CASE name
+  WHEN 'user' THEN ARRAY['requests:create', 'requests:read:own']
+  WHEN 'support' THEN ARRAY['requests:create', 'requests:read:own', 'requests:read:all', 'requests:update']
+  WHEN 'admin' THEN ARRAY['requests:create', 'requests:read:own', 'requests:read:all', 'requests:update',
+    'users:read', 'users:roles:update', 'roles:read', 'sales:read', 'stock:read']
+END WHERE name IN ('user', 'support', 'admin');
 
 CREATE TABLE IF NOT EXISTS users (
   id UUID PRIMARY KEY,
@@ -24,6 +33,13 @@ CREATE TABLE IF NOT EXISTS users (
 ALTER TABLE users ENABLE ROW LEVEL SECURITY;
 -- Also upgrades installations whose users table predates database roles.
 ALTER TABLE users ADD COLUMN IF NOT EXISTS role TEXT NOT NULL DEFAULT 'user' REFERENCES roles(name);
+-- Empty grants deny entity data access, including for existing administrators.
+ALTER TABLE users ADD COLUMN IF NOT EXISTS target_entities TEXT[] NOT NULL DEFAULT '{}'
+  CHECK (target_entities <@ ARRAY['agritehnica', 'green', 'babyhub']::text[]
+    AND array_position(target_entities, NULL) IS NULL);
+ALTER TABLE users ADD COLUMN IF NOT EXISTS is_active BOOLEAN NOT NULL DEFAULT TRUE;
+-- Keep an identity tombstone so Microsoft sign-in cannot undo deletion.
+ALTER TABLE users ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
 
 CREATE TABLE IF NOT EXISTS support_requests (
   id UUID PRIMARY KEY,

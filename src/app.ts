@@ -1,19 +1,23 @@
 import express from 'express';
-import type { ErrorRequestHandler } from 'express';
+import type { ErrorRequestHandler, Request } from 'express';
 import cors from 'cors';
 import helmet from 'helmet';
 import { rateLimit } from 'express-rate-limit';
 import { authenticatedUser, createAuthenticate } from './auth.js';
 import { UUID } from './config.js';
 import { HttpError } from './errors.js';
-import type { AppConfig, GraphFetch, Store } from './types.js';
-import { isRecord, isRequestPriority, isRequestStatus } from './validation.js';
-import { isRole, permissionsFor, requirePermission } from './permissions.js';
+import type { AppConfig, GraphFetch, Store, TargetEntity, UserUpdate } from './types.js';
+import { isRecord, isRequestPriority, isRequestStatus, isTargetEntity } from './validation.js';
+import { assignablePermissions, isRoleName, permissionsFor, requirePermission } from './permissions.js';
+import type { BorgFetch } from './borg.js';
+import { createSalesClient, parseSalesQuery } from './sales.js';
+import { createStockClient, parseStockQuery } from './stock.js';
 
 interface AppOptions {
   config: AppConfig;
   store: Store;
   fetchGraph?: GraphFetch;
+  fetchBorg?: BorgFetch;
   rateLimitMax?: number;
 }
 
@@ -37,8 +41,16 @@ function pageNumber(value: unknown, fallback: number, max: number, min = 0): num
   return Number(value);
 }
 
-export function createApp({ config, store, fetchGraph, rateLimitMax = 120 }: AppOptions) {
+function requireEntity(req: Request, entity: TargetEntity) {
+  if (!authenticatedUser(req).targetEntities.includes(entity)) {
+    throw new HttpError(403, 'Your account does not have access to this entity.');
+  }
+}
+
+export function createApp({ config, store, fetchGraph, fetchBorg, rateLimitMax = 120 }: AppOptions) {
   const app = express();
+  const fetchSales = createSalesClient(config.borg, fetchBorg);
+  const fetchStock = createStockClient(config.borg, fetchBorg);
   app.disable('x-powered-by');
   app.set('trust proxy', config.trustProxyHops);
   app.use(helmet());
@@ -47,7 +59,7 @@ export function createApp({ config, store, fetchGraph, rateLimitMax = 120 }: App
       if (!origin || config.origins.includes(origin)) return callback(null, true);
       callback(new HttpError(403, 'This frontend origin is not allowed.'));
     },
-    methods: ['GET', 'POST', 'PATCH'],
+    methods: ['GET', 'POST', 'PATCH', 'DELETE'],
     allowedHeaders: ['Authorization', 'Content-Type'],
   }));
   app.get('/', (req, res) => res.json({ service: 'AGS support API', health: '/health' }));
@@ -73,20 +85,33 @@ export function createApp({ config, store, fetchGraph, rateLimitMax = 120 }: App
   api.use(createAuthenticate(config, fetchGraph));
   api.use(async (req, res, next) => {
     const user = authenticatedUser(req);
-    const role = (await store.getUserRole(user)) ?? 'user';
-    if (!isRole(role)) throw new HttpError(403, 'Your account has an unsupported role.');
-    user.role = role;
-    user.isAdmin = role === 'admin';
+    const access = await store.getUserAccess(user);
+    if (access && (!access.isActive || access.deletedAt)) throw new HttpError(403, 'Your account is inactive or deleted.');
+    user.role = access?.role ?? 'user';
+    user.permissions = access?.permissions ?? permissionsFor('user');
+    user.targetEntities = access?.targetEntities ?? [];
+    user.isActive = access?.isActive ?? true;
+    user.isAdmin = user.role === 'admin';
     next();
   });
   api.use(express.json({ limit: '32kb' }));
   api.get('/me', (req, res) => {
     const user = authenticatedUser(req);
-    res.json({ user: { ...user, permissions: permissionsFor(user.role) } });
+    res.json({ user });
+  });
+  api.get('/borg/sales', requirePermission('sales:read'), async (req, res) => {
+    const query = parseSalesQuery(req.query);
+    requireEntity(req, query.targetEntity);
+    res.json(await fetchSales(query));
+  });
+  api.get('/borg/stock', requirePermission('stock:read'), async (req, res) => {
+    const query = parseStockQuery(req.query);
+    requireEntity(req, query.targetEntity);
+    res.json(await fetchStock(query));
   });
   api.get('/roles', requirePermission('roles:read'), async (req, res) => {
     const roles = await store.listRoles();
-    res.json({ roles: roles.map(role => ({ ...role, permissions: permissionsFor(role.name) })) });
+    res.json({ roles, assignablePermissions });
   });
   api.get('/users', requirePermission('users:read'), async (req, res) => {
     const limit = pageNumber(req.query.limit, 20, 100, 1);
@@ -97,10 +122,52 @@ export function createApp({ config, store, fetchGraph, rateLimitMax = 120 }: App
   api.patch<{ id: string }>('/users/:id/role', requirePermission('users:roles:update'), async (req, res) => {
     const body: unknown = req.body;
     bodyFields(body, ['role']);
-    if (!isRole(body.role)) throw new HttpError(400, 'role must be user, support, or admin.');
+    if (!isRoleName(body.role)) throw new HttpError(400, 'Invalid role name.');
     const user = await store.updateUserRole(authenticatedUser(req), req.params.id, body.role);
-    if (!user) throw new HttpError(404, 'User not found or administrator access was revoked.');
+    if (!user) throw new HttpError(404, 'User not found.');
     res.json({ user });
+  });
+  api.post('/roles', requirePermission('users:roles:update'), async (req, res) => {
+    const body: unknown = req.body;
+    bodyFields(body, ['name', 'description', 'permissions']);
+    if (!isRoleName(body.name)) throw new HttpError(400, 'Role name must be 1–50 lowercase letters, digits, underscores or hyphens, starting with a letter.');
+    const description = textField(body.description, 'description', 500);
+    const permissions = body.permissions === undefined ? [] : body.permissions;
+    if (!Array.isArray(permissions) || !permissions.every(value => assignablePermissions.includes(value))
+      || new Set(permissions).size !== permissions.length) {
+      throw new HttpError(400, 'permissions must be a unique array of supported data permissions.');
+    }
+    const role = await store.createRole(authenticatedUser(req), { name: body.name, description, permissions });
+    res.status(201).location(`/api/roles/${role.name}`).json({ role });
+  });
+  api.delete<{ name: string }>('/roles/:name', requirePermission('users:roles:update'), async (req, res) => {
+    if (!isRoleName(req.params.name)) throw new HttpError(400, 'Invalid role name.');
+    if (!await store.deleteRole(authenticatedUser(req), req.params.name)) throw new HttpError(404, 'Role not found.');
+    res.status(204).end();
+  });
+  api.patch<{ id: string }>('/users/:id', requirePermission('users:roles:update'), async (req, res) => {
+    const body: unknown = req.body;
+    bodyFields(body, ['targetEntities', 'isActive']);
+    if (!Object.keys(body).length) throw new HttpError(400, 'Provide targetEntities or isActive.');
+    const input: UserUpdate = {};
+    if ('targetEntities' in body) {
+      if (!Array.isArray(body.targetEntities) || !body.targetEntities.every(isTargetEntity)
+        || new Set(body.targetEntities).size !== body.targetEntities.length) {
+        throw new HttpError(400, 'targetEntities must be a unique array containing agritehnica, green, or babyhub.');
+      }
+      input.targetEntities = body.targetEntities;
+    }
+    if ('isActive' in body) {
+      if (typeof body.isActive !== 'boolean') throw new HttpError(400, 'isActive must be a boolean.');
+      input.isActive = body.isActive;
+    }
+    const user = await store.updateUser(authenticatedUser(req), req.params.id, input);
+    if (!user) throw new HttpError(404, 'User not found.');
+    res.json({ user });
+  });
+  api.delete<{ id: string }>('/users/:id', requirePermission('users:roles:update'), async (req, res) => {
+    if (!await store.deleteUser(authenticatedUser(req), req.params.id)) throw new HttpError(404, 'User not found.');
+    res.status(204).end();
   });
   api.post('/users', async (req, res) => {
     // The bearer token is the only source of identity; no profile or role input.
@@ -128,7 +195,7 @@ export function createApp({ config, store, fetchGraph, rateLimitMax = 120 }: App
     res.json({ requests, limit, offset });
   });
   api.param('id', (req, res, next, id: unknown) => {
-    if (typeof id !== 'string' || !UUID.test(id)) throw new HttpError(400, 'Request ID must be a UUID.');
+    if (typeof id !== 'string' || !UUID.test(id)) throw new HttpError(400, 'ID must be a UUID.');
     next();
   });
   api.get<{ id: string }>('/requests/:id', requirePermission('requests:read:own'), async (req, res) => {

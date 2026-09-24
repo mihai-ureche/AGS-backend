@@ -1,9 +1,15 @@
+import type { Permission } from './permissions.js';
+
 export interface AppConfig {
   tenantId: string;
   databaseUrl: string;
   origins: string[];
   port: number;
   trustProxyHops: number;
+  borg?: {
+    baseUrl: string;
+    authorization: string;
+  };
 }
 
 export interface AuthenticatedUser {
@@ -13,12 +19,28 @@ export interface AuthenticatedUser {
   email: string | null;
   isAdmin: boolean;
   role: Role;
+  permissions: readonly Permission[];
+  targetEntities: TargetEntity[];
+  isActive: boolean;
 }
 
-export type Role = 'user' | 'support' | 'admin';
+export type Role = string;
+export type TargetEntity = 'agritehnica' | 'green' | 'babyhub';
+export interface UserAccess {
+  role: Role;
+  permissions: readonly Permission[];
+  targetEntities: TargetEntity[];
+  isActive: boolean;
+  deletedAt: Date | null;
+}
+export interface UserUpdate {
+  targetEntities?: TargetEntity[];
+  isActive?: boolean;
+}
 export interface StoredRole {
   name: Role;
   description: string;
+  permissions: readonly Permission[];
 }
 
 export interface StoredUser {
@@ -28,6 +50,9 @@ export interface StoredUser {
   displayName: string | null;
   email: string | null;
   role: Role;
+  targetEntities: TargetEntity[];
+  isActive: boolean;
+  deletedAt: Date | null;
   createdAt: Date;
   updatedAt: Date;
   lastSeenAt: Date;
@@ -60,7 +85,11 @@ export interface RequestPage {
 
 export interface Store {
   health(): Promise<void>;
-  getUserRole(user: AuthenticatedUser): Promise<Role | undefined>;
+  getUserAccess(user: AuthenticatedUser): Promise<UserAccess | undefined>;
+  createRole(user: AuthenticatedUser, input: StoredRole): Promise<StoredRole>;
+  deleteRole(user: AuthenticatedUser, name: string): Promise<boolean>;
+  updateUser(user: AuthenticatedUser, id: string, input: UserUpdate): Promise<StoredUser | undefined>;
+  deleteUser(user: AuthenticatedUser, id: string): Promise<boolean>;
   listRoles(): Promise<StoredRole[]>;
   listUsers(user: AuthenticatedUser, page: Pick<RequestPage, 'limit' | 'offset'>): Promise<StoredUser[]>;
   updateUserRole(user: AuthenticatedUser, id: string, role: Role): Promise<StoredUser | undefined>;
