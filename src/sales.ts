@@ -1,9 +1,9 @@
 import { HttpError } from './errors.js';
-import type { AppConfig } from './types.js';
-import { isRecord } from './validation.js';
+import type { AppConfig, TargetEntity } from './types.js';
+import { isRecord, isTargetEntity } from './validation.js';
 
 export interface SalesQuery {
-  targetEntity: 'agritehnica' | 'green' | 'babyhub';
+  targetEntity: TargetEntity;
   from: string;
   to: string;
   gestiune?: number;
@@ -40,7 +40,7 @@ export function parseSalesQuery(query: Record<string, unknown>): SalesQuery {
   const allowed = ['targetEntity', 'from', 'to', 'gestiune', 'docType', 'limit', 'includeTransfers'];
   if (Object.keys(query).some(key => !allowed.includes(key))) throw new HttpError(400, 'Unsupported sales query parameter.');
   const { targetEntity, docType, includeTransfers } = query;
-  if (targetEntity !== 'agritehnica' && targetEntity !== 'green' && targetEntity !== 'babyhub') {
+  if (!isTargetEntity(targetEntity)) {
     throw new HttpError(400, 'targetEntity must be agritehnica, green, or babyhub.');
   }
   const from = date(query.from, 'from');

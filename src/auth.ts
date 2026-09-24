@@ -50,6 +50,9 @@ export function createAuthenticate(config: AppConfig, fetchGraph: GraphFetch = f
       email: typeof profile.mail === 'string' ? profile.mail : typeof profile.userPrincipalName === 'string' ? profile.userPrincipalName : null,
       isAdmin: false,
       role: 'user',
+      permissions: [],
+      targetEntities: [],
+      isActive: true,
     };
     next();
   };

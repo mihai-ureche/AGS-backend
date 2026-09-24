@@ -14,7 +14,7 @@ createdb ags
 npm run dev
 ```
 
-The server listens on `http://localhost:3000`. Tables and indexes are created automatically at startup. The database must already exist. `createdb` uses your local PostgreSQL account; adjust `DATABASE_URL` to match it. Future schema changes should use migrations.
+The server listens on `http://localhost:3000`. Tables and indexes are created automatically at startup. The database must already exist. `createdb` uses your local PostgreSQL account; adjust `DATABASE_URL` to match it. Startup also applies the idempotent schema upgrades described below.
 
 All application and test code is TypeScript with strict type checking. `npm run dev` runs `src/server.ts` with automatic reloads. Production runs compiled JavaScript:
 
@@ -76,24 +76,28 @@ Every `/api/*` request requires `Authorization: Bearer YOUR_GRAPH_ACCESS_TOKEN`.
 | Method | Path | Result |
 | --- | --- | --- |
 | GET | `/health` | Public database health check; `200` healthy, `503` unavailable |
-| GET | `/api/me` | `{ user: { id, tenantId, displayName, email, role, isAdmin, permissions } }` |
+| GET | `/api/me` | `{ user: { id, tenantId, displayName, email, role, isAdmin, permissions, targetEntities, isActive } }` |
 | POST | `/api/users` | Create or refresh your database user from Microsoft; returns `200` and `{ user }` |
 | GET | `/api/users` | Admin only: list users in your organization with `limit` and `offset` |
-| GET | `/api/roles` | Admin only: available roles and their permissions |
-| PATCH | `/api/users/:id/role` | Admin only: assign `{ "role": "user\|support\|admin" }` using the database user ID |
+| GET | `/api/roles` | Admin only: `{ roles, assignablePermissions }` |
+| POST | `/api/roles` | Admin only: create `{ name, description, permissions? }`; returns `201` and `{ role }` |
+| DELETE | `/api/roles/:name` | Admin only: delete an unassigned custom role; returns `204` |
+| PATCH | `/api/users/:id/role` | Admin only: assign `{ "role": "existing-role-name" }` using the database user ID |
+| PATCH | `/api/users/:id` | Admin only: replace `targetEntities` and/or set `isActive`; returns `{ user }` |
+| DELETE | `/api/users/:id` | Admin only: soft-delete a user; returns `204` |
 | POST | `/api/requests` | Create a request; returns `201` and `{ request }` |
 | GET | `/api/requests` | List your requests; staff see all requests in the tenant |
 | GET | `/api/requests/:id` | Retrieve your request; staff can retrieve any in the tenant |
 | PATCH | `/api/requests/:id` | Staff only: update status with `{ "status": "in_progress" }` |
-| GET | `/api/borg/sales` | Admin only: proxy Borg sales filters and return the plain product-line array |
+| GET | `/api/borg/sales` | Requires `sales:read` and an explicit grant for `targetEntity`; returns the plain product-line array |
 
 Create requires `title` (1–200 characters) and `description` (1–10,000 characters). Optional `priority` is `low`, `normal` (default), or `high`. New requests start as `open`. Unknown body fields are rejected, including attempts to set an owner or staff role.
 
-Statuses: `open`, `in_progress`, `resolved`, `closed`. Users with the `support` or `admin` role can move requests between any statuses, including reopening, within their organization.
+Statuses: `open`, `in_progress`, `resolved`, `closed`. Users with `requests:update` (including `support` and `admin`) can move requests between any statuses, including reopening, within their organization.
 
 List filters: `?status=open&limit=20&offset=0`. Limit defaults to 20, maximum 100; offset defaults to 0, maximum 1,000,000. Results are newest first and return `{ requests, limit, offset }`. Regular users receive `404` when requesting another user's request.
 
-A request has `id`, `title`, `description`, `priority`, `status`, `ownerId`, `ownerName`, `ownerEmail`, `createdAt`, and `updatedAt`. Errors use `{ "error": "message" }` with an appropriate HTTP status. The API allows 120 requests per minute per IP per running instance; adjust for shared office networks or multiple instances. Attachments, comments, notifications, and deletion are outside this starter's scope.
+A request has `id`, `title`, `description`, `priority`, `status`, `ownerId`, `ownerName`, `ownerEmail`, `createdAt`, and `updatedAt`. Errors use `{ "error": "message" }` with an appropriate HTTP status. The API allows 120 requests per minute per IP per running instance; adjust for shared office networks or multiple instances. Attachments, comments, notifications, and support-request deletion are outside this starter's scope.
 
 ### Save the signed-in user
 
@@ -113,25 +117,27 @@ async function createUser(accessToken: string) {
 const user = await createUser(result.accessToken);
 ```
 
-The response contains `id` (the database user UUID), `microsoftUserId`, `tenantId`, `displayName`, `email`, `role`, `createdAt`, `updatedAt`, and `lastSeenAt`. Timestamps are ISO strings; name and email can be null. The database `id` is distinct from the Microsoft ID returned by `/api/me` and used for request ownership.
+The response contains `id` (the database user UUID), `microsoftUserId`, `tenantId`, `displayName`, `email`, `role`, `targetEntities`, `isActive`, `deletedAt`, `createdAt`, `updatedAt`, and `lastSeenAt`. Timestamps are ISO strings; name and email can be null. The database `id` is distinct from the Microsoft ID returned by `/api/me` and used for request ownership.
 
-The backend verifies the Microsoft profile and organization before writing. A unique `(tenant_id, microsoft_user_id)` constraint makes repeat and concurrent calls safe: existing users keep their database ID and creation timestamp while their profile, update timestamp, and last-seen timestamp are refreshed. No password or token is stored. `lastSeenAt` records the last successful call to this endpoint.
+The backend verifies the Microsoft profile and organization before writing. A unique `(tenant_id, microsoft_user_id)` constraint makes repeat and concurrent calls safe: existing users keep their database ID and creation timestamp while their profile, update timestamp, and last-seen timestamp are refreshed. Profile refreshes preserve role, entity grants, and activation state. Inactive or deleted accounts receive `403` and cannot refresh or recreate their profile. No password or token is stored. `lastSeenAt` records the last successful call to this endpoint.
 
 Restart the backend after updating: startup creates the `users` table if absent. Row-level security is enabled without public policies so profile access goes through this backend. Its database connection must use the table owner or a role with `BYPASSRLS`, as the current Supabase `postgres` connection does.
 
 ### Roles and permissions
 
-The `roles` table contains three built-in roles, referenced by `users.role`:
+The `roles` table stores permission arrays and has three protected built-in roles, referenced by `users.role`. Each user has one role:
 
 | Role | Permissions |
 | --- | --- |
 | `user` | Create requests and view their own requests |
 | `support` | User permissions plus view and update all requests in their organization |
-| `admin` | Support permissions plus list users/roles, assign roles, and read Borg sales |
+| `admin` | Support permissions plus manage users/roles and read Borg sales for explicitly assigned entities |
 
-Startup adds the role column to existing installations and gives existing and new users the `user` role. Assigned roles survive both restarts and profile refreshes. Permissions are defined in `src/permissions.ts`; changing a role description does not change its permissions. Additional roles require an intentional schema and code update.
+New users have the basic `user` role, `targetEntities: []`, and `isActive: true`: they can create/view their own support requests but cannot read any Borg entity data. Startup adds `users.target_entities` (PostgreSQL `TEXT[]`, empty by default), `is_active`, and `deleted_at`, and upgrades the former fixed-role constraint to allow custom roles. **Existing users, including admins, receive an empty entity list on upgrade.** Existing role assignments are preserved. Entity grants and custom roles survive restarts and profile refreshes.
 
-After Microsoft authentication, the backend reads the role from PostgreSQL on every request. Accounts without a saved profile have only `user` access. Database lookup failures deny access rather than trusting frontend data. `/api/me` returns `role`, `permissions`, and `isAdmin` (true only for `admin`). Use permission strings such as `requests:update` to show frontend controls; backend route checks and organization/ownership filters enforce access independently.
+Permissions for saved accounts come from `roles.permissions`. The built-in permission sets are maintained at startup; custom roles are left unchanged. The service uses one configured Microsoft tenant; role definitions belong to this backend installation.
+
+After Microsoft authentication, the backend reads the role permissions, activation state, deletion state, and entity grants from PostgreSQL on every request. Accounts without a saved profile have only `user` access and no entity grants. Inactive and deleted accounts receive `403` on every authenticated endpoint. Database lookup failures deny access rather than trusting frontend data. `/api/me` returns `role`, `permissions`, `targetEntities`, `isActive`, and `isAdmin` (true only for `admin`). Use permission strings such as `requests:update` to show frontend controls; backend route checks and organization/ownership filters enforce access independently.
 
 To assign the first administrator:
 
@@ -162,7 +168,37 @@ const data = await response.json();
 if (!response.ok) throw new Error(data.error);
 ```
 
-The endpoint returns `200` with `{ user }`. Non-admins receive `403`; unknown roles or unsupported fields return `400`; missing or cross-organization targets return `404`. Administrators cannot demote their own account (`409`); the operator command supports recovery. Role changes take effect on the next API request without signing in again. Public Supabase Data API access to `roles` and `users` is blocked by row-level security without public policies; assignments go through this backend or a trusted database operator.
+The endpoint returns `200` with `{ user }`. Non-admins receive `403`; unknown roles or unsupported fields return `400`; missing or cross-organization targets return `404`. Administrators cannot demote, deactivate, or delete their own account (`409`); the operator command supports recovery. Role changes take effect on the next API request without signing in again. Public Supabase Data API access to `roles` and `users` is blocked by row-level security without public policies; assignments go through this backend or a trusted database operator.
+
+### Custom roles and user management
+
+All management endpoints require an active administrator. Use the database user UUID from `POST /api/users` or `GET /api/users`, not the Microsoft user ID.
+
+Create a role with `POST /api/roles`:
+
+```json
+{
+  "name": "sales-reader",
+  "description": "Read sales for assigned entities",
+  "permissions": ["sales:read"]
+}
+```
+
+Names must start with a lowercase letter and contain only lowercase letters, digits, `_`, or `-` (1–50 characters). Description is required (1–500 characters). Permissions default to `[]`; allowed values are returned as `assignablePermissions` by `GET /api/roles`: `requests:create`, `requests:read:own`, `requests:read:all`, `requests:update`, and `sales:read`. `requests:read:all` includes reading one's own requests. Custom roles cannot grant user or role administration; assign the built-in `admin` role for that. Unknown or duplicate permissions return `400`.
+
+Assign the role with `PATCH /api/users/:id/role` and `{ "role": "sales-reader" }`. Assigning `user` removes elevated role permissions. Role assignment does not change the user's entity grants. Delete a custom role with `DELETE /api/roles/:name`; built-in roles, duplicate role names, and deletion of assigned roles return `409`. Reassign all users of a custom role before deleting it. Missing roles return `404`.
+
+Set entity grants with `PATCH /api/users/:id`:
+
+```json
+{ "targetEntities": ["agritehnica", "babyhub"] }
+```
+
+This replaces the complete entity list. Allowed entries are `agritehnica`, `green`, and `babyhub`; duplicates and unknown values are rejected. Send `{ "targetEntities": [] }` to revoke all entity access. Sales requires **both** `sales:read` and the requested entity in this list, including for admins. Users with only the basic `user` role need a sales-capable role as well as an entity grant. Support requests retain their existing organization/ownership rules and are not Borg entity data.
+
+Use the same endpoint with `{ "isActive": false }` to deactivate or `{ "isActive": true }` to reactivate an account. Both fields can be updated together. Omitted fields remain unchanged; empty bodies and unsupported fields return `400`. Deactivation preserves role and entity grants for reactivation. Changes apply to the next API request; already-running requests are not cancelled.
+
+`DELETE /api/users/:id` soft-deletes the account: it sets `deletedAt`, deactivates it, clears entity grants, and resets its role to `user`. The identity row and support history are retained so Microsoft sign-in cannot undo deletion. Deleted users cannot be reactivated or assigned roles through the API; use deactivation for temporary suspension. Missing, already-deleted, or cross-organization targets return `404`. `GET /api/users` includes inactive and deleted users with their state fields so the frontend can distinguish them. These endpoints affect backend access only, not the Microsoft directory account.
 
 ### Borg sales
 
@@ -175,7 +211,7 @@ BORG_API_AUTHORIZATION="YOUR_EXACT_AUTHORIZATION_HEADER_VALUE"
 
 Use the full sales endpoint URL, including its path. The documentation's example includes `/api2/borg/sales`; confirm the actual URL with your Borg service. Prefer HTTPS. Set the authorization value exactly as Borg expects: `Bearer <token>` if it uses Bearer authentication, otherwise the raw token. In Render's value fields, omit the surrounding dotenv quotes. For an existing Render Blueprint, add these variables manually in the service's Environment settings. Leave both empty to disable this integration (`503`); providing only one is a configuration error. Restart/redeploy after setting them.
 
-The frontend sends its **Microsoft Graph access token** to this backend. The backend verifies the user's saved `admin` role (`sales:read`), then uses the separate Borg credential for the upstream request. It never forwards the Microsoft token to Borg. All admins in the configured Microsoft organization can currently query any of the three Borg entities; `user` and `support` receive `403`.
+The frontend sends its **Microsoft Graph access token** to this backend. The backend verifies the user's saved `sales:read` permission and explicit grant for the requested `targetEntity`, then uses the separate Borg credential for the upstream request. It never forwards the Microsoft token to Borg. An empty entity list denies all Borg data access, even for admins. The built-in `user` and `support` roles lack `sales:read`; create and assign a custom sales role when appropriate.
 
 ```ts
 const query = new URLSearchParams({
