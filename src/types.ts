@@ -4,6 +4,10 @@ export interface AppConfig {
   origins: string[];
   port: number;
   trustProxyHops: number;
+  borg?: {
+    salesUrl: string;
+    authorization: string;
+  };
 }
 
 export interface AuthenticatedUser {

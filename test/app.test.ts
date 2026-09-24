@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import request from 'supertest';
 import { createApp } from '../src/app.js';
 import { readConfig } from '../src/config.js';
+import type { BorgFetch } from '../src/sales.js';
 import type { AppConfig, AuthenticatedUser, CreateRequestInput, GraphFetch, RequestPage, Role, Store, SupportRequest } from '../src/types.js';
 
 const tenantId = '11111111-1111-1111-1111-111111111111';
@@ -14,6 +15,7 @@ interface SetupOptions {
   config?: Partial<AppConfig>;
   store?: Partial<Store>;
   fetchGraph?: GraphFetch;
+  fetchBorg?: BorgFetch;
   tenantId?: string;
   rateLimitMax?: number;
   role?: Role;
@@ -55,7 +57,7 @@ function setup(options: SetupOptions = {}) {
       ? { id: userId, displayName: 'Test User', mail: 'user@example.com' }
       : { value: [{ id: options.tenantId ?? tenantId }] });
   });
-  const app = createApp({ config: { ...config, ...options.config }, store, fetchGraph, rateLimitMax: options.rateLimitMax ?? 120 });
+  const app = createApp({ config: { ...config, ...options.config }, store, fetchGraph, fetchBorg: options.fetchBorg, rateLimitMax: options.rateLimitMax ?? 120 });
   return { client: request(app), calls, graphCalls };
 }
 const bearer = ['Authorization', 'Bearer opaque-graph-token'] as const;
@@ -314,4 +316,57 @@ test('role lookup never runs for invalid or foreign Microsoft identities', async
   const store = { getUserRole: async () => { assert.fail('Unverified identity reached the database'); } };
   await setup({ store }).client.get('/api/roles').expect(401);
   await setup({ store, tenantId: requestId }).client.get('/api/roles').set(...bearer).expect(403);
+});
+
+const salesPath = '/api/borg/sales?targetEntity=babyhub&from=2026-09-01&to=2026-09-30';
+const borgConfig = { salesUrl: 'https://borg.example/api2/borg/sales', authorization: 'Bearer private-borg-token' };
+
+test('only verified admins can call Borg sales; role revocation takes effect on the next request', async () => {
+  let count = 0;
+  const fetchBorg: BorgFetch = async () => { count++; return Response.json([]); };
+  for (const role of ['user', 'support'] as const) {
+    await setup({ role, config: { borg: borgConfig }, fetchBorg }).client.get(salesPath).set(...bearer).expect(403);
+  }
+  await setup({ role: 'admin', config: { borg: borgConfig }, fetchBorg }).client.get(salesPath).expect(401);
+  await setup({ role: 'admin', tenantId: requestId, config: { borg: borgConfig }, fetchBorg }).client.get(salesPath).set(...bearer).expect(403);
+  assert.equal(count, 0);
+  let role: Role = 'admin';
+  const { client } = setup({ store: { getUserRole: async () => role }, config: { borg: borgConfig }, fetchBorg });
+  await client.get(salesPath).set(...bearer).expect(200, []);
+  role = 'support';
+  await client.get(salesPath).set(...bearer).expect(403);
+  assert.equal(count, 1);
+});
+
+test('Borg sales returns the plain array and keeps frontend and upstream credentials separate', async () => {
+  const lines = [{ documentId: 2157, cantitate: -1, valoareTotal: -1332, facturaData: null }];
+  const { client } = setup({ role: 'admin', config: { borg: borgConfig }, fetchBorg: async (url, init) => {
+    assert.equal(new Headers(init.headers).get('Authorization'), borgConfig.authorization);
+    assert.ok(!url.includes('opaque-graph-token'));
+    return Response.json(lines);
+  } });
+  const response = await client.get(`${salesPath}&docType=BFD&gestiune=2`).set(...bearer).expect(200, lines);
+  assert.equal(response.headers['cache-control'], 'no-store');
+  assert.ok(!response.text.includes('private-borg-token'));
+  const me = await client.get('/api/me').set(...bearer).expect(200);
+  assert.ok(me.body.user.permissions.includes('sales:read'));
+});
+
+test('invalid sales queries are rejected before calling Borg', async () => {
+  const { client } = setup({ role: 'admin', config: { borg: borgConfig }, fetchBorg: async () => { assert.fail('Invalid query reached Borg'); } });
+  for (const path of [
+    '/api/borg/sales',
+    '/api/borg/sales?targetEntity=babyhub&from=2026-08-01&to=2026-08-31',
+    '/api/borg/sales?targetEntity=babyhub&from=2026-12-31&to=2027-01-01',
+    `${salesPath}&targetEntity=green`, `${salesPath}&limit=50001`, `${salesPath}&from=2026-09-02`,
+    `${salesPath}&includeTransfers=1`, `${salesPath}&url=https://attacker.example`,
+  ]) await client.get(path).set(...bearer).expect(400);
+});
+
+test('unconfigured Borg and upstream failures return safe API errors', async () => {
+  await setup({ role: 'admin' }).client.get(salesPath).set(...bearer).expect(503);
+  const { client } = setup({ role: 'admin', config: { borg: borgConfig }, fetchBorg: async () => new Response('private-borg-token', { status: 401 }) });
+  const response = await client.get(salesPath).set(...bearer).expect(502);
+  assert.ok(!response.text.includes('private-borg-token'));
+  assert.equal(response.headers['www-authenticate'], undefined);
 });

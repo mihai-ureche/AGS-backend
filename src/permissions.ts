@@ -4,13 +4,13 @@ import { HttpError } from './errors.js';
 import type { Role } from './types.js';
 
 export type Permission = 'requests:create' | 'requests:read:own' | 'requests:read:all'
-  | 'requests:update' | 'users:read' | 'users:roles:update' | 'roles:read';
+  | 'requests:update' | 'users:read' | 'users:roles:update' | 'roles:read' | 'sales:read';
 
 const permissions: Record<Role, readonly Permission[]> = {
   user: ['requests:create', 'requests:read:own'],
   support: ['requests:create', 'requests:read:own', 'requests:read:all', 'requests:update'],
   admin: ['requests:create', 'requests:read:own', 'requests:read:all', 'requests:update',
-    'users:read', 'users:roles:update', 'roles:read'],
+    'users:read', 'users:roles:update', 'roles:read', 'sales:read'],
 };
 
 export function isRole(value: unknown): value is Role {

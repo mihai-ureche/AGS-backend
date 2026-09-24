@@ -9,11 +9,14 @@ import { HttpError } from './errors.js';
 import type { AppConfig, GraphFetch, Store } from './types.js';
 import { isRecord, isRequestPriority, isRequestStatus } from './validation.js';
 import { isRole, permissionsFor, requirePermission } from './permissions.js';
+import { createSalesClient, parseSalesQuery } from './sales.js';
+import type { BorgFetch } from './sales.js';
 
 interface AppOptions {
   config: AppConfig;
   store: Store;
   fetchGraph?: GraphFetch;
+  fetchBorg?: BorgFetch;
   rateLimitMax?: number;
 }
 
@@ -37,8 +40,9 @@ function pageNumber(value: unknown, fallback: number, max: number, min = 0): num
   return Number(value);
 }
 
-export function createApp({ config, store, fetchGraph, rateLimitMax = 120 }: AppOptions) {
+export function createApp({ config, store, fetchGraph, fetchBorg, rateLimitMax = 120 }: AppOptions) {
   const app = express();
+  const fetchSales = createSalesClient(config.borg, fetchBorg);
   app.disable('x-powered-by');
   app.set('trust proxy', config.trustProxyHops);
   app.use(helmet());
@@ -83,6 +87,10 @@ export function createApp({ config, store, fetchGraph, rateLimitMax = 120 }: App
   api.get('/me', (req, res) => {
     const user = authenticatedUser(req);
     res.json({ user: { ...user, permissions: permissionsFor(user.role) } });
+  });
+  api.get('/borg/sales', requirePermission('sales:read'), async (req, res) => {
+    const query = parseSalesQuery(req.query);
+    res.json(await fetchSales(query));
   });
   api.get('/roles', requirePermission('roles:read'), async (req, res) => {
     const roles = await store.listRoles();

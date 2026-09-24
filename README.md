@@ -85,6 +85,7 @@ Every `/api/*` request requires `Authorization: Bearer YOUR_GRAPH_ACCESS_TOKEN`.
 | GET | `/api/requests` | List your requests; staff see all requests in the tenant |
 | GET | `/api/requests/:id` | Retrieve your request; staff can retrieve any in the tenant |
 | PATCH | `/api/requests/:id` | Staff only: update status with `{ "status": "in_progress" }` |
+| GET | `/api/borg/sales` | Admin only: proxy Borg sales filters and return the plain product-line array |
 
 Create requires `title` (1–200 characters) and `description` (1–10,000 characters). Optional `priority` is `low`, `normal` (default), or `high`. New requests start as `open`. Unknown body fields are rejected, including attempts to set an owner or staff role.
 
@@ -126,7 +127,7 @@ The `roles` table contains three built-in roles, referenced by `users.role`:
 | --- | --- |
 | `user` | Create requests and view their own requests |
 | `support` | User permissions plus view and update all requests in their organization |
-| `admin` | Support permissions plus list users/roles and assign roles in their organization |
+| `admin` | Support permissions plus list users/roles, assign roles, and read Borg sales |
 
 Startup adds the role column to existing installations and gives existing and new users the `user` role. Assigned roles survive both restarts and profile refreshes. Permissions are defined in `src/permissions.ts`; changing a role description does not change its permissions. Additional roles require an intentional schema and code update.
 
@@ -163,6 +164,52 @@ if (!response.ok) throw new Error(data.error);
 
 The endpoint returns `200` with `{ user }`. Non-admins receive `403`; unknown roles or unsupported fields return `400`; missing or cross-organization targets return `404`. Administrators cannot demote their own account (`409`); the operator command supports recovery. Role changes take effect on the next API request without signing in again. Public Supabase Data API access to `roles` and `users` is blocked by row-level security without public policies; assignments go through this backend or a trusted database operator.
 
+### Borg sales
+
+Configure these **backend-only** environment variables in `.env` locally and in the Render service's Environment settings:
+
+```dotenv
+BORG_SALES_URL="https://YOUR_BORG_HOST/api2/borg/sales"
+BORG_API_AUTHORIZATION="YOUR_EXACT_AUTHORIZATION_HEADER_VALUE"
+```
+
+Use the full sales endpoint URL, including its path. The documentation's example includes `/api2/borg/sales`; confirm the actual URL with your Borg service. Prefer HTTPS. Set the authorization value exactly as Borg expects: `Bearer <token>` if it uses Bearer authentication, otherwise the raw token. In Render's value fields, omit the surrounding dotenv quotes. For an existing Render Blueprint, add these variables manually in the service's Environment settings. Leave both empty to disable this integration (`503`); providing only one is a configuration error. Restart/redeploy after setting them.
+
+The frontend sends its **Microsoft Graph access token** to this backend. The backend verifies the user's saved `admin` role (`sales:read`), then uses the separate Borg credential for the upstream request. It never forwards the Microsoft token to Borg. All admins in the configured Microsoft organization can currently query any of the three Borg entities; `user` and `support` receive `403`.
+
+```ts
+const query = new URLSearchParams({
+  targetEntity: 'babyhub',
+  from: '2026-09-01',
+  to: '2026-09-30',
+  docType: 'BFD',
+  gestiune: '2',
+  limit: '5000',
+  includeTransfers: 'false',
+});
+const response = await fetch(`${API_URL}/api/borg/sales?${query}`, {
+  headers: { Authorization: `Bearer ${result.accessToken}` },
+});
+const data = await response.json();
+if (!response.ok) throw new Error(data.error);
+const lines = data; // Plain array, including [] when no sales match.
+```
+
+| Query field | Validation/default |
+| --- | --- |
+| `targetEntity` | Required: `agritehnica`, `green`, or `babyhub` |
+| `from`, `to` | Required, real `YYYY-MM-DD` dates; `from <= to` |
+| `gestiune` | Optional positive safe integer warehouse ID |
+| `docType` | Optional `BFD` or `AIM`; omit for both |
+| `limit` | Integer 1–50000; default 5000 |
+| `includeTransfers` | Literal `true` or `false`; default `false` |
+
+The interval may include **at most 30 calendar days, counting both endpoints**, and must stay in one calendar year. September 1–30 is valid; August 1–31 is not. Ranges can cross month boundaries within the same year if they still fit within 30 days. Split longer ranges into non-overlapping requests. Invalid, repeated, or unknown query parameters return `400` before contacting Borg.
+
+Product lines, negative return quantities/values, nullable invoice fields, costs, and margins are passed through without aggregation or database storage. The response has no wrapper, totals, or truncation flag. If `lines.length === limit`, treat the result as potentially truncated and raise the limit or narrow the interval before computing dashboard totals. Requests are not automatically retried or paginated, and responses have `Cache-Control: no-store`.
+
+The upstream call times out after 30 seconds (`504`) and does not follow redirects. An upstream `400` becomes a sanitized `400`; throttling or temporary unavailability becomes `503`; other upstream HTTP, connection, or malformed-response failures become `502`. Upstream error bodies and credentials are never returned to the frontend. `401`/`403` from Borg become `502` because they indicate a backend integration problem, not a failed Microsoft login.
+
 ## Deploy on Render
 
 1. Push this repository to your Git provider.
@@ -176,6 +223,8 @@ The endpoint returns `200` with `{ user }`. Non-admins receive `403`; unknown ro
 | `DATABASE_URL` | Render Postgres **internal** database URL for the same region/workspace |
 | `MICROSOFT_TENANT_ID` | Your directory's tenant UUID |
 | `FRONTEND_ORIGINS` | Exact frontend origin, e.g. `https://help.example.com`; comma-separated for multiple origins, no trailing slash |
+| `BORG_SALES_URL` | Optional full Borg sales endpoint URL; required with `BORG_API_AUTHORIZATION` |
+| `BORG_API_AUTHORIZATION` | Optional secret: exact upstream Authorization header value |
 | `TRUST_PROXY_HOPS` | `1` behind Render's proxy; `0` locally; match your actual proxy topology |
 | `PORT` | Provided by Render; defaults to `3000` locally |
 
