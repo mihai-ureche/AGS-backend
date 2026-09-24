@@ -4,7 +4,7 @@ import request from 'supertest';
 import { permissionsFor } from '../src/permissions.js';
 import { createApp } from '../src/app.js';
 import { readConfig } from '../src/config.js';
-import type { BorgFetch } from '../src/sales.js';
+import type { BorgFetch } from '../src/borg.js';
 import type { AppConfig, AuthenticatedUser, CreateRequestInput, GraphFetch, RequestPage, Role, Store, SupportRequest, UserAccess } from '../src/types.js';
 
 const tenantId = '11111111-1111-1111-1111-111111111111';
@@ -331,7 +331,7 @@ test('role lookup never runs for invalid or foreign Microsoft identities', async
 });
 
 const salesPath = '/api/borg/sales?targetEntity=babyhub&from=2026-09-01&to=2026-09-30';
-const borgConfig = { salesUrl: 'https://borg.example/api2/borg/sales', authorization: 'Bearer private-borg-token' };
+const borgConfig = { baseUrl: 'https://borg.example/api2/borg', authorization: 'Bearer private-borg-token' };
 
 test('only verified admins can call Borg sales; role revocation takes effect on the next request', async () => {
   let count = 0;
@@ -407,6 +407,33 @@ test('custom sales roles can access only assigned entities and cannot manage acc
   await client.get(salesPath.replace('babyhub', 'green')).set(...bearer).expect(403);
   await client.get('/api/users').set(...bearer).expect(403);
   await client.get('/api/requests').set(...bearer).expect(403);
+});
+
+const stockPath = '/api/borg/stock?code=4063846331017&targetEntity=babyhub';
+
+test('Borg stock requires stock:read and an entity grant, and rejects invalid queries before calling Borg', async () => {
+  const stock = [{ gestiune: 2, cantitate: 5 }];
+  let calls = 0;
+  let permissions: UserAccess['permissions'] = ['sales:read'];
+  const { client } = setup({ config: { borg: borgConfig }, store: {
+    getUserAccess: async () => ({ ...access('stock-reader', ['babyhub']), permissions }),
+  }, fetchBorg: async (url, init) => {
+    calls++;
+    assert.equal(new URL(url).pathname, '/api2/borg/stock');
+    assert.equal(new Headers(init.headers).get('Authorization'), borgConfig.authorization);
+    return Response.json(stock);
+  } });
+  await client.get(stockPath).set(...bearer).expect(403);
+  permissions = ['stock:read'];
+  const response = await client.get(stockPath).set(...bearer).expect(200, stock);
+  assert.equal(response.headers['cache-control'], 'no-store');
+  await client.get(stockPath.replace('babyhub', 'green')).set(...bearer).expect(403);
+  for (const path of ['/api/borg/stock', '/api/borg/stock?targetEntity=babyhub', `${stockPath}&code=1`, `${stockPath}&url=https://attacker.example`]) {
+    await client.get(path).set(...bearer).expect(400);
+  }
+  assert.equal(calls, 1);
+  assert.ok(access('admin').permissions.includes('stock:read'));
+  assert.ok(!access('support').permissions.includes('stock:read'));
 });
 
 test('inactive and deleted accounts cannot use any authenticated endpoint or recreate themselves', async () => {

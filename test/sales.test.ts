@@ -4,7 +4,7 @@ import { readConfig } from '../src/config.js';
 import { createSalesClient, parseSalesQuery } from '../src/sales.js';
 
 const base = { targetEntity: 'babyhub', from: '2026-09-01', to: '2026-09-30' };
-const borg = { salesUrl: 'https://borg.example/api2/borg/sales', authorization: 'Bearer private-borg-token' };
+const borg = { baseUrl: 'https://borg.example/api2/borg', authorization: 'Bearer private-borg-token' };
 
 test('sales validates inclusive 30-day ranges, leap days, and cross-month intervals', () => {
   for (const [from, to] of [
@@ -92,13 +92,17 @@ test('sales sanitizes upstream errors, redirects, invalid JSON, and timeouts', a
   await assert.rejects(createSalesClient(undefined, async () => { assert.fail('Unconfigured API called Borg'); })(query), { status: 503 });
 });
 
-test('Borg configuration is optional but requires a valid complete credential pair', () => {
+test('Borg is enabled by its credential, defaults to the Agritehnica base URL, and validates overrides', () => {
   const env = { MICROSOFT_TENANT_ID: '11111111-1111-1111-1111-111111111111', DATABASE_URL: 'postgresql://localhost/ags', FRONTEND_ORIGINS: 'http://localhost:5173' };
   assert.equal(readConfig(env).borg, undefined);
-  assert.deepEqual(readConfig({ ...env, BORG_SALES_URL: borg.salesUrl, BORG_API_AUTHORIZATION: borg.authorization }).borg, borg);
+  assert.deepEqual(readConfig({ ...env, BORG_API_AUTHORIZATION: borg.authorization }).borg,
+    { baseUrl: 'https://borg.agritehnica.ro/api2/borg', authorization: borg.authorization });
+  for (const BORG_API_URL of ['https://borg.example/api2/borg', 'https://borg.example/api2/borg/', ' https://borg.example/api2/borg// ']) {
+    assert.deepEqual(readConfig({ ...env, BORG_API_URL, BORG_API_AUTHORIZATION: borg.authorization }).borg, borg);
+  }
   for (const patch of [
-    { BORG_SALES_URL: borg.salesUrl }, { BORG_API_AUTHORIZATION: borg.authorization },
-    ...['not-a-url', 'ftp://borg.example/sales', 'https://user:password@borg.example/sales', 'https://borg.example/sales?token=secret', 'https://borg.example/sales#fragment'].map(BORG_SALES_URL => ({ BORG_SALES_URL, BORG_API_AUTHORIZATION: borg.authorization })),
-    { BORG_SALES_URL: borg.salesUrl, BORG_API_AUTHORIZATION: 'token\r\nX-Injected: value' },
+    { BORG_API_URL: borg.baseUrl },
+    ...['not-a-url', 'ftp://borg.example/api2/borg', 'https://user:password@borg.example/api2/borg', 'https://borg.example/api2/borg?token=secret', 'https://borg.example/api2/borg#fragment'].map(BORG_API_URL => ({ BORG_API_URL, BORG_API_AUTHORIZATION: borg.authorization })),
+    { BORG_API_AUTHORIZATION: 'token\r\nX-Injected: value' },
   ]) assert.throws(() => readConfig({ ...env, ...patch }));
 });

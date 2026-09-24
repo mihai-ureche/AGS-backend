@@ -1,16 +1,17 @@
 import express from 'express';
-import type { ErrorRequestHandler } from 'express';
+import type { ErrorRequestHandler, Request } from 'express';
 import cors from 'cors';
 import helmet from 'helmet';
 import { rateLimit } from 'express-rate-limit';
 import { authenticatedUser, createAuthenticate } from './auth.js';
 import { UUID } from './config.js';
 import { HttpError } from './errors.js';
-import type { AppConfig, GraphFetch, Store, UserUpdate } from './types.js';
+import type { AppConfig, GraphFetch, Store, TargetEntity, UserUpdate } from './types.js';
 import { isRecord, isRequestPriority, isRequestStatus, isTargetEntity } from './validation.js';
 import { assignablePermissions, isRoleName, permissionsFor, requirePermission } from './permissions.js';
+import type { BorgFetch } from './borg.js';
 import { createSalesClient, parseSalesQuery } from './sales.js';
-import type { BorgFetch } from './sales.js';
+import { createStockClient, parseStockQuery } from './stock.js';
 
 interface AppOptions {
   config: AppConfig;
@@ -40,9 +41,16 @@ function pageNumber(value: unknown, fallback: number, max: number, min = 0): num
   return Number(value);
 }
 
+function requireEntity(req: Request, entity: TargetEntity) {
+  if (!authenticatedUser(req).targetEntities.includes(entity)) {
+    throw new HttpError(403, 'Your account does not have access to this entity.');
+  }
+}
+
 export function createApp({ config, store, fetchGraph, fetchBorg, rateLimitMax = 120 }: AppOptions) {
   const app = express();
   const fetchSales = createSalesClient(config.borg, fetchBorg);
+  const fetchStock = createStockClient(config.borg, fetchBorg);
   app.disable('x-powered-by');
   app.set('trust proxy', config.trustProxyHops);
   app.use(helmet());
@@ -93,10 +101,13 @@ export function createApp({ config, store, fetchGraph, fetchBorg, rateLimitMax =
   });
   api.get('/borg/sales', requirePermission('sales:read'), async (req, res) => {
     const query = parseSalesQuery(req.query);
-    if (!authenticatedUser(req).targetEntities.includes(query.targetEntity)) {
-      throw new HttpError(403, 'Your account does not have access to this entity.');
-    }
+    requireEntity(req, query.targetEntity);
     res.json(await fetchSales(query));
+  });
+  api.get('/borg/stock', requirePermission('stock:read'), async (req, res) => {
+    const query = parseStockQuery(req.query);
+    requireEntity(req, query.targetEntity);
+    res.json(await fetchStock(query));
   });
   api.get('/roles', requirePermission('roles:read'), async (req, res) => {
     const roles = await store.listRoles();

@@ -15,7 +15,7 @@ UPDATE roles SET permissions = CASE name
   WHEN 'user' THEN ARRAY['requests:create', 'requests:read:own']
   WHEN 'support' THEN ARRAY['requests:create', 'requests:read:own', 'requests:read:all', 'requests:update']
   WHEN 'admin' THEN ARRAY['requests:create', 'requests:read:own', 'requests:read:all', 'requests:update',
-    'users:read', 'users:roles:update', 'roles:read', 'sales:read']
+    'users:read', 'users:roles:update', 'roles:read', 'sales:read', 'stock:read']
 END WHERE name IN ('user', 'support', 'admin');
 
 CREATE TABLE IF NOT EXISTS users (

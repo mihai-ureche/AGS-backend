@@ -1,3 +1,5 @@
+import { requestBorg } from './borg.js';
+import type { BorgFetch } from './borg.js';
 import { HttpError } from './errors.js';
 import type { AppConfig, TargetEntity } from './types.js';
 import { isRecord, isTargetEntity } from './validation.js';
@@ -11,8 +13,6 @@ export interface SalesQuery {
   limit: number;
   includeTransfers: boolean;
 }
-
-export type BorgFetch = (url: string, init: RequestInit) => Promise<Response>;
 
 function date(value: unknown, field: string): { text: string; timestamp: number } {
   if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(value) || value.startsWith('0000')) {
@@ -63,41 +63,15 @@ export function parseSalesQuery(query: Record<string, unknown>): SalesQuery {
 
 export function createSalesClient(config: AppConfig['borg'], fetchBorg: BorgFetch = fetch) {
   return async (query: SalesQuery): Promise<Record<string, unknown>[]> => {
-    if (!config) throw new HttpError(503, 'Borg sales is not configured. Contact an administrator.');
-    const url = new URL(config.salesUrl);
-    url.searchParams.set('targetEntity', query.targetEntity);
-    url.searchParams.set('from', query.from);
-    url.searchParams.set('to', query.to);
-    url.searchParams.set('limit', String(query.limit));
-    url.searchParams.set('includeTransfers', String(query.includeTransfers));
-    if (query.gestiune !== undefined) url.searchParams.set('gestiune', String(query.gestiune));
-    if (query.docType !== undefined) url.searchParams.set('docType', query.docType);
-
-    const signal = AbortSignal.timeout(30000);
-    try {
-      const response = await fetchBorg(url.toString(), {
-        method: 'GET',
-        headers: { Authorization: config.authorization, Accept: 'application/json' },
-        redirect: 'error', signal,
-      });
-      if (!response.ok) {
-        await response.body?.cancel();
-        if (response.status === 400) throw new HttpError(400, 'Borg rejected the sales filters.');
-        if (response.status === 429 || response.status === 503) throw new HttpError(503, 'Borg sales is temporarily unavailable. Try again later.');
-        throw new HttpError(502, 'Borg could not complete the sales request.');
-      }
-      const lines: unknown = await response.json();
-      if (!Array.isArray(lines) || lines.length > query.limit || !lines.every(isRecord)) {
-        throw new HttpError(502, 'Borg returned an invalid sales response.');
-      }
-      // Preserve raw values (including returns, nulls, costs, and margins).
-      return lines;
-    } catch (error) {
-      if (error instanceof HttpError) throw error;
-      if (signal.aborted || (error instanceof Error && error.name === 'TimeoutError')) {
-        throw new HttpError(504, 'Borg sales request timed out. Try a smaller interval.');
-      }
-      throw new HttpError(502, 'Borg sales could not be reached or returned an invalid response.');
+    const lines = await requestBorg(config, fetchBorg, 'sales', {
+      targetEntity: query.targetEntity, from: query.from, to: query.to,
+      limit: String(query.limit), includeTransfers: String(query.includeTransfers),
+      gestiune: query.gestiune?.toString(), docType: query.docType,
+    });
+    if (!Array.isArray(lines) || lines.length > query.limit || !lines.every(isRecord)) {
+      throw new HttpError(502, 'Borg returned an invalid sales response.');
     }
+    // Preserve raw values (including returns, nulls, costs, and margins).
+    return lines;
   };
 }

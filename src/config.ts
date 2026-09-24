@@ -1,6 +1,8 @@
 import type { AppConfig } from './types.js';
 
-export const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+export const DEFAULT_BORG_API_URL = 'https://borg.agritehnica.ro/api2/borg';
+
+export const UUID =/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 export function readConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   const tenantId = env.MICROSOFT_TENANT_ID?.trim().toLowerCase();
@@ -18,20 +20,19 @@ export function readConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   const trustProxyHops = Number(env.TRUST_PROXY_HOPS ?? 0);
   if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error('PORT must be between 1 and 65535.');
   if (!Number.isInteger(trustProxyHops) || trustProxyHops < 0 || trustProxyHops > 5) throw new Error('TRUST_PROXY_HOPS must be between 0 and 5.');
-  const salesUrl = env.BORG_SALES_URL?.trim();
+  const apiUrl = env.BORG_API_URL?.trim();
   const authorization = env.BORG_API_AUTHORIZATION?.trim();
-  if (Boolean(salesUrl) !== Boolean(authorization)) {
-    throw new Error('Set both BORG_SALES_URL and BORG_API_AUTHORIZATION, or leave both empty.');
-  }
+  if (apiUrl && !authorization) throw new Error('Set BORG_API_AUTHORIZATION to use BORG_API_URL, or leave both empty.');
   let borg: AppConfig['borg'];
-  if (salesUrl && authorization) {
+  if (authorization) {
     let url: URL;
-    try { url = new URL(salesUrl); } catch { throw new Error('BORG_SALES_URL must be a full HTTP(S) sales endpoint URL.'); }
+    try { url = new URL(apiUrl || DEFAULT_BORG_API_URL); } catch { throw new Error('BORG_API_URL must be a full HTTP(S) base URL.'); }
     if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.search || url.hash) {
-      throw new Error('BORG_SALES_URL must be an HTTP(S) endpoint without credentials, query parameters, or a fragment.');
+      throw new Error('BORG_API_URL must be an HTTP(S) base URL without credentials, query parameters, or a fragment.');
     }
     if (!/^[\x20-\x7e]+$/.test(authorization)) throw new Error('BORG_API_AUTHORIZATION must be a single printable ASCII header value.');
-    borg = { salesUrl: url.toString(), authorization };
+    // Endpoints such as /sales and /stock are appended to this base.
+    borg = { baseUrl: url.origin + url.pathname.replace(/\/+$/, ''), authorization };
   }
   return { tenantId, databaseUrl: env.DATABASE_URL, origins, port, trustProxyHops, borg };
 }

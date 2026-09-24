@@ -7,7 +7,7 @@ export interface AppConfig {
   port: number;
   trustProxyHops: number;
   borg?: {
-    salesUrl: string;
+    baseUrl: string;
     authorization: string;
   };
 }

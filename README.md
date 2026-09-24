@@ -90,6 +90,7 @@ Every `/api/*` request requires `Authorization: Bearer YOUR_GRAPH_ACCESS_TOKEN`.
 | GET | `/api/requests/:id` | Retrieve your request; staff can retrieve any in the tenant |
 | PATCH | `/api/requests/:id` | Staff only: update status with `{ "status": "in_progress" }` |
 | GET | `/api/borg/sales` | Requires `sales:read` and an explicit grant for `targetEntity`; returns the plain product-line array |
+| GET | `/api/borg/stock` | Requires `stock:read` and an explicit grant for `targetEntity`; returns Borg's stock JSON unchanged |
 
 Create requires `title` (1–200 characters) and `description` (1–10,000 characters). Optional `priority` is `low`, `normal` (default), or `high`. New requests start as `open`. Unknown body fields are rejected, including attempts to set an owner or staff role.
 
@@ -131,7 +132,7 @@ The `roles` table stores permission arrays and has three protected built-in role
 | --- | --- |
 | `user` | Create requests and view their own requests |
 | `support` | User permissions plus view and update all requests in their organization |
-| `admin` | Support permissions plus manage users/roles and read Borg sales for explicitly assigned entities |
+| `admin` | Support permissions plus manage users/roles and read Borg sales and stock for explicitly assigned entities |
 
 New users have the basic `user` role, `targetEntities: []`, and `isActive: true`: they can create/view their own support requests but cannot read any Borg entity data. Startup adds `users.target_entities` (PostgreSQL `TEXT[]`, empty by default), `is_active`, and `deleted_at`, and upgrades the former fixed-role constraint to allow custom roles. **Existing users, including admins, receive an empty entity list on upgrade.** Existing role assignments are preserved. Entity grants and custom roles survive restarts and profile refreshes.
 
@@ -184,7 +185,7 @@ Create a role with `POST /api/roles`:
 }
 ```
 
-Names must start with a lowercase letter and contain only lowercase letters, digits, `_`, or `-` (1–50 characters). Description is required (1–500 characters). Permissions default to `[]`; allowed values are returned as `assignablePermissions` by `GET /api/roles`: `requests:create`, `requests:read:own`, `requests:read:all`, `requests:update`, and `sales:read`. `requests:read:all` includes reading one's own requests. Custom roles cannot grant user or role administration; assign the built-in `admin` role for that. Unknown or duplicate permissions return `400`.
+Names must start with a lowercase letter and contain only lowercase letters, digits, `_`, or `-` (1–50 characters). Description is required (1–500 characters). Permissions default to `[]`; allowed values are returned as `assignablePermissions` by `GET /api/roles`: `requests:create`, `requests:read:own`, `requests:read:all`, `requests:update`, `sales:read`, and `stock:read`. `requests:read:all` includes reading one's own requests. Custom roles cannot grant user or role administration; assign the built-in `admin` role for that. Unknown or duplicate permissions return `400`.
 
 Assign the role with `PATCH /api/users/:id/role` and `{ "role": "sales-reader" }`. Assigning `user` removes elevated role permissions. Role assignment does not change the user's entity grants. Delete a custom role with `DELETE /api/roles/:name`; built-in roles, duplicate role names, and deletion of assigned roles return `409`. Reassign all users of a custom role before deleting it. Missing roles return `404`.
 
@@ -200,16 +201,32 @@ Use the same endpoint with `{ "isActive": false }` to deactivate or `{ "isActive
 
 `DELETE /api/users/:id` soft-deletes the account: it sets `deletedAt`, deactivates it, clears entity grants, and resets its role to `user`. The identity row and support history are retained so Microsoft sign-in cannot undo deletion. Deleted users cannot be reactivated or assigned roles through the API; use deactivation for temporary suspension. Missing, already-deleted, or cross-organization targets return `404`. `GET /api/users` includes inactive and deleted users with their state fields so the frontend can distinguish them. These endpoints affect backend access only, not the Microsoft directory account.
 
-### Borg sales
+### Borg configuration
 
-Configure these **backend-only** environment variables in `.env` locally and in the Render service's Environment settings:
+The backend calls Borg below one base URL, `https://borg.agritehnica.ro/api2/borg` by default, appending the endpoint: `/sales` and `/stock`. Configure the **backend-only** credential in `.env` locally and in the Render service's Environment settings:
 
 ```dotenv
-BORG_SALES_URL="https://YOUR_BORG_HOST/api2/borg/sales"
 BORG_API_AUTHORIZATION="YOUR_EXACT_AUTHORIZATION_HEADER_VALUE"
+# Optional: only to use a different Borg host. No endpoint path, query, or fragment.
+# BORG_API_URL="https://borg.agritehnica.ro/api2/borg"
 ```
 
-Use the full sales endpoint URL, including its path. The documentation's example includes `/api2/borg/sales`; confirm the actual URL with your Borg service. Prefer HTTPS. Set the authorization value exactly as Borg expects: `Bearer <token>` if it uses Bearer authentication, otherwise the raw token. In Render's value fields, omit the surrounding dotenv quotes. For an existing Render Blueprint, add these variables manually in the service's Environment settings. Leave both empty to disable this integration (`503`); providing only one is a configuration error. Restart/redeploy after setting them.
+Set the authorization value exactly as Borg expects: `Bearer <token>` if it uses Bearer authentication, otherwise the raw token. In Render's value fields, omit the surrounding dotenv quotes. Leave `BORG_API_AUTHORIZATION` empty to disable the integration (`503`); setting `BORG_API_URL` without it is a configuration error. `BORG_SALES_URL` is no longer read. Restart/redeploy after changing these values.
+
+### Borg stock
+
+```ts
+const query = new URLSearchParams({ code: '4063846331017', targetEntity: 'babyhub' });
+const response = await fetch(`${API_URL}/api/borg/stock?${query}`, {
+  headers: { Authorization: `Bearer ${result.accessToken}` },
+});
+const data = await response.json();
+if (!response.ok) throw new Error(data.error);
+```
+
+`code` is required: 1–64 letters, digits, `.`, `_`, or `-`. `targetEntity` is required and must be in the user's entity grants; the user also needs `stock:read` (included in `admin`; add it to custom roles as needed). Borg's JSON object or array of objects is returned unchanged. Errors, timeouts, and credential handling match Borg sales below.
+
+### Borg sales
 
 The frontend sends its **Microsoft Graph access token** to this backend. The backend verifies the user's saved `sales:read` permission and explicit grant for the requested `targetEntity`, then uses the separate Borg credential for the upstream request. It never forwards the Microsoft token to Borg. An empty entity list denies all Borg data access, even for admins. The built-in `user` and `support` roles lack `sales:read`; create and assign a custom sales role when appropriate.
 
@@ -259,8 +276,8 @@ The upstream call times out after 30 seconds (`504`) and does not follow redirec
 | `DATABASE_URL` | Render Postgres **internal** database URL for the same region/workspace |
 | `MICROSOFT_TENANT_ID` | Your directory's tenant UUID |
 | `FRONTEND_ORIGINS` | Exact frontend origin, e.g. `https://help.example.com`; comma-separated for multiple origins, no trailing slash |
-| `BORG_SALES_URL` | Optional full Borg sales endpoint URL; required with `BORG_API_AUTHORIZATION` |
-| `BORG_API_AUTHORIZATION` | Optional secret: exact upstream Authorization header value |
+| `BORG_API_AUTHORIZATION` | Optional secret: exact upstream Authorization header value; enables Borg |
+| `BORG_API_URL` | Optional Borg base URL; defaults to `https://borg.agritehnica.ro/api2/borg` |
 | `TRUST_PROXY_HOPS` | `1` behind Render's proxy; `0` locally; match your actual proxy topology |
 | `PORT` | Provided by Render; defaults to `3000` locally |
 

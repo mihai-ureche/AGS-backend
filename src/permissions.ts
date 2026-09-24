@@ -4,17 +4,17 @@ import { HttpError } from './errors.js';
 import type { AuthenticatedUser, Role } from './types.js';
 
 export type Permission = 'requests:create' | 'requests:read:own' | 'requests:read:all'
-  | 'requests:update' | 'users:read' | 'users:roles:update' | 'roles:read' | 'sales:read';
+  | 'requests:update' | 'users:read' | 'users:roles:update' | 'roles:read' | 'sales:read' | 'stock:read';
 
 const permissions: Record<string, readonly Permission[]> = {
   user: ['requests:create', 'requests:read:own'],
   support: ['requests:create', 'requests:read:own', 'requests:read:all', 'requests:update'],
   admin: ['requests:create', 'requests:read:own', 'requests:read:all', 'requests:update',
-    'users:read', 'users:roles:update', 'roles:read', 'sales:read'],
+    'users:read', 'users:roles:update', 'roles:read', 'sales:read', 'stock:read'],
 };
 
 export const assignablePermissions: readonly Permission[] = [
-  'requests:create', 'requests:read:own', 'requests:read:all', 'requests:update', 'sales:read',
+  'requests:create', 'requests:read:own', 'requests:read:all', 'requests:update', 'sales:read', 'stock:read',
 ];
 
 export function isRoleName(value: unknown): value is string {
