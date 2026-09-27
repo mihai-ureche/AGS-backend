@@ -52,6 +52,7 @@ export function createAuthenticate(config: AppConfig, fetchGraph: GraphFetch = f
       role: 'user',
       permissions: [],
       targetEntities: [],
+      salesGroups: [],
       isActive: true,
     };
     next();

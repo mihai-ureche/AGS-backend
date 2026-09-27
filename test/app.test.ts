@@ -1,6 +1,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import request from 'supertest';
+import { revenueGroupIds } from '../src/revenue.js';
+import type { RevenueConfiguration } from '../src/revenue.js';
 import { permissionsFor } from '../src/permissions.js';
 import { createApp } from '../src/app.js';
 import { readConfig } from '../src/config.js';
@@ -29,8 +31,16 @@ const storedRequest: SupportRequest = {
   createdAt: new Date('2026-01-01T00:00:00Z'), updatedAt: new Date('2026-01-01T00:00:00Z'),
 };
 
+const grouping: RevenueConfiguration = {
+  targetEntity: 'agritehnica', enabled: true, revision: 1, defaultGroupId: 'piese',
+  groups: revenueGroupIds.map(id => ({ id, name: id })),
+  rules: [{ category: 'Utilaje', groupId: 'utilaje' }, { category: 'Irigații', groupId: 'irigatii' },
+    { category: 'Alte materiale consumabile', groupId: 'other' }, { category: 'Cheltuieli Diverse', groupId: 'other' },
+    { category: 'Manipulare', groupId: 'manopera' }],
+};
+
 function access(role: Role = 'user', targetEntities: UserAccess['targetEntities'] = []): UserAccess {
-  return { role, permissions: permissionsFor(role), targetEntities, isActive: true, deletedAt: null };
+  return { role, permissions: permissionsFor(role), salesGroups: null, targetEntities, isActive: true, deletedAt: null };
 }
 
 function setup(options: SetupOptions = {}) {
@@ -38,11 +48,14 @@ function setup(options: SetupOptions = {}) {
   const store: Store = {
     health: async () => {},
     getUserAccess: async () => access(options.role, options.targetEntities),
-    createRole: async (user, role) => role,
+    createRole: async (user, role) => ({ ...role, salesGroups: role.salesGroups === undefined ? [] : role.salesGroups }),
+    updateRoleSalesGroups: async () => undefined,
+    getRevenueConfiguration: async entity => ({ ...grouping, targetEntity: entity, enabled: entity === 'agritehnica' }),
+    updateRevenueConfiguration: async (user, entity, input) => ({ ...grouping, ...input, targetEntity: entity, revision: input.revision + 1 }),
     deleteRole: async () => false,
     updateUser: async () => undefined,
     deleteUser: async () => false,
-    listRoles: async () => [{ name: 'user', description: 'Own requests', permissions: permissionsFor('user') }],
+    listRoles: async () => [{ name: 'user', description: 'Own requests', permissions: permissionsFor('user'), salesGroups: null }],
     listUsers: async () => [],
     updateUserRole: async () => undefined,
     createUser: async user => {
@@ -86,7 +99,7 @@ test('createUser saves the verified Microsoft profile with no body or an empty o
   assert.equal(calls.length, 2);
   assert.deepEqual(calls[0]?.user, {
     id: userId, tenantId, displayName: 'Test User', email: 'user@example.com', isAdmin: false, role: 'user',
-    permissions: permissionsFor('user'), targetEntities: [], isActive: true,
+    permissions: permissionsFor('user'), salesGroups: null, targetEntities: [], isActive: true,
   });
   assert.ok(!first.text.includes('opaque-graph-token'));
 });
@@ -136,7 +149,7 @@ test('missing and malformed tokens never reach Graph', async () => {
 test('opaque tokens work through Graph with verified identity', async () => {
   const { client, graphCalls } = setup();
   const { body, headers } = await client.get('/api/me').set(...bearer).expect(200);
-  assert.deepEqual(body.user, { id: userId, tenantId, displayName: 'Test User', email: 'user@example.com', isAdmin: false, role: 'user', permissions: ['requests:create', 'requests:read:own'], targetEntities: [], isActive: true });
+  assert.deepEqual(body.user, { id: userId, tenantId, displayName: 'Test User', email: 'user@example.com', isAdmin: false, role: 'user', permissions: ['requests:create', 'requests:read:own'], salesGroups: null, targetEntities: [], isActive: true });
   assert.equal(headers['cache-control'], 'no-store');
   assert.equal(graphCalls.length, 2);
   for (const call of graphCalls) {
@@ -357,7 +370,7 @@ test('Borg sales returns the plain array and keeps frontend and upstream credent
     assert.ok(!url.includes('opaque-graph-token'));
     return Response.json(lines);
   } });
-  const response = await client.get(`${salesPath}&docType=BFD&gestiune=2`).set(...bearer).expect(200, lines);
+  const response = await client.get(`${salesPath}&docType=BFD&gestiune=2`).set(...bearer).expect(200, lines.map(line => ({ ...line, revenueGroupId: null, revenueGroupName: null })));
   assert.equal(response.headers['cache-control'], 'no-store');
   assert.ok(!response.text.includes('private-borg-token'));
   const me = await client.get('/api/me').set(...bearer).expect(200);
@@ -461,7 +474,7 @@ test('new user profile bodies cannot supply entity grants or account state', asy
 test('role creation validates permissions and allows roles with no permissions', async () => {
   const { client } = setup({ role: 'admin' });
   const role = { name: 'sales-reader', description: 'Read selected sales', permissions: ['sales:read'] };
-  await client.post('/api/roles').set(...bearer).send(role).expect(201, { role });
+  await client.post('/api/roles').set(...bearer).send(role).expect(201, { role: { ...role, salesGroups: [] } });
   const empty = await client.post('/api/roles').set(...bearer).send({ name: 'empty', description: 'No access' }).expect(201);
   assert.deepEqual(empty.body.role.permissions, []);
   for (const patch of [{ name: 'Invalid' }, { name: 'a'.repeat(51) }, { description: '' },
@@ -530,4 +543,65 @@ test('custom read-all permission also permits reading own requests', async () =>
   assert.equal(calls.length, 1);
   await client.get(`/api/requests/${requestId}`).set(...bearer).expect(404);
   await client.post('/api/requests').set(...bearer).send({ title: 'Help', description: 'Help' }).expect(403);
+});
+
+test('group restrictions cover both sales formats, filters, metadata, and role revocation', async () => {
+  let groups: UserAccess['salesGroups'] = ['utilaje'];
+  let calls = 0;
+  const raw = [
+    { miscareId: 1, grupa: 'Utilaje', valoareNet: 100 },
+    { miscareId: 2, grupa: 'Manipulare', valoareNet: 20, revenueGroupId: 'utilaje' },
+    { miscareId: 3, grupa: 'Filtre', valoareNet: -10 },
+  ];
+  const { client } = setup({ config: { borg: borgConfig }, store: {
+    getUserAccess: async () => ({ ...access('reader', ['agritehnica', 'green']), permissions: ['sales:read'], salesGroups: groups }),
+  }, fetchBorg: async () => { calls++; return Response.json(raw); } });
+  const path = salesPath.replace('babyhub', 'agritehnica');
+  const legacy = await client.get(path).set(...bearer).expect(200);
+  assert.deepEqual(legacy.body.map((line: { miscareId: number }) => line.miscareId), [1]);
+  const grouped = await client.get(`${path}&responseFormat=grouped&limit=3`).set(...bearer).expect(200);
+  assert.deepEqual(grouped.body.lines, legacy.body);
+  assert.equal(grouped.body.possiblyTruncated, true);
+  const meta = await client.get('/api/revenue-groups?targetEntity=agritehnica').set(...bearer).expect(200);
+  assert.deepEqual(meta.body.groups.map((group: { id: string }) => group.id), ['utilaje']);
+  assert.equal(meta.body.accessVersion, grouped.body.accessVersion);
+  await client.get(`${path}&revenueGroupId=piese`).set(...bearer).expect(403);
+  await client.get(`${path}&revenueGroupId=other&gestiune=2`).set(...bearer).expect(403);
+  await client.get(`${path}&revenueGroupId=unknown`).set(...bearer).expect(400);
+  await client.get(`${path}&responseFormat=raw`).set(...bearer).expect(400);
+  await client.get(`${path}&revenueGroupId=utilaje&revenueGroupId=piese`).set(...bearer).expect(400);
+  await client.get(path.replace('agritehnica', 'babyhub')).set(...bearer).expect(403);
+  await client.get(path.replace('agritehnica', 'green')).set(...bearer).expect(403);
+  assert.equal(calls, 2);
+  groups = ['manopera', 'piese'];
+  const service = await client.get(`${path}&responseFormat=grouped`).set(...bearer).expect(200);
+  assert.deepEqual(service.body.lines.map((line: { miscareId: number }) => line.miscareId), [2, 3]);
+  assert.notEqual(service.body.accessVersion, grouped.body.accessVersion);
+  groups = [];
+  await client.get(path).set(...bearer).expect(403);
+  await client.get('/api/revenue-groups?targetEntity=agritehnica').set(...bearer).expect(403);
+  assert.equal(calls, 3);
+});
+
+test('group configuration and role grants require administrators and validate the complete payload', async () => {
+  const input = { enabled: grouping.enabled, revision: grouping.revision, defaultGroupId: grouping.defaultGroupId, rules: grouping.rules };
+  const { client } = setup({ role: 'admin', store: {
+    updateRoleSalesGroups: async (user, name, salesGroups) => ({ name, description: 'Sales', permissions: ['sales:read'], salesGroups }),
+  } });
+  await client.get('/api/admin/revenue-groups/agritehnica').set(...bearer).expect(200);
+  const saved = await client.patch('/api/admin/revenue-groups/agritehnica').set(...bearer).send(input).expect(200);
+  assert.equal(saved.body.revision, 2);
+  await client.patch('/api/admin/revenue-groups/agritehnica').set(...bearer).send({ ...input, rules: [{ category: 'X', groupId: 'unknown' }] }).expect(400);
+  await client.patch('/api/admin/revenue-groups/unknown').set(...bearer).send(input).expect(400);
+  for (const salesGroups of [null, [], ['utilaje']]) {
+    const updated = await client.patch('/api/roles/reader/sales-groups').set(...bearer).send({ salesGroups }).expect(200);
+    assert.deepEqual(updated.body.role.salesGroups, salesGroups);
+  }
+  for (const body of [{}, { salesGroups: ['unknown'] }, { salesGroups: ['piese', 'piese'] }, { salesGroups: [], permissions: ['sales:read'] }]) {
+    await client.patch('/api/roles/reader/sales-groups').set(...bearer).send(body).expect(400);
+  }
+  const reader = setup({ store: { getUserAccess: async () => ({ ...access('reader', ['agritehnica']), permissions: ['sales:read'] }) } }).client;
+  await reader.get('/api/admin/revenue-groups/agritehnica').set(...bearer).expect(403);
+  await reader.patch('/api/admin/revenue-groups/agritehnica').set(...bearer).send(input).expect(403);
+  await reader.patch('/api/roles/reader/sales-groups').set(...bearer).send({ salesGroups: null }).expect(403);
 });

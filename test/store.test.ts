@@ -18,7 +18,7 @@ test('PostgreSQL persistence and user/staff/tenant isolation', { skip: !process.
     await pool.query(ddl);
     await pool.query(ddl);
     const store = createStore(pool);
-    const owner: AuthenticatedUser = { id: randomUUID(), tenantId: randomUUID(), displayName: 'Owner', email: 'owner@example.com', isAdmin: false, role: 'user', permissions: permissionsFor('user'), targetEntities: [], isActive: true };
+    const owner: AuthenticatedUser = { id: randomUUID(), tenantId: randomUUID(), displayName: 'Owner', email: 'owner@example.com', isAdmin: false, role: 'user', permissions: permissionsFor('user'), targetEntities: [], salesGroups: null, isActive: true };
     const other = { ...owner, id: randomUUID() };
     const staff: AuthenticatedUser = { ...other, isAdmin: false, role: 'support', permissions: permissionsFor('support') };
     const foreignStaff = { ...staff, tenantId: randomUUID() };
@@ -153,7 +153,7 @@ test('user lifecycle, entity grants, and custom roles persist with administrator
     await pool.query(ddl);
     const store = createStore(pool);
     const admin: AuthenticatedUser = { id: randomUUID(), tenantId: randomUUID(), displayName: 'Admin', email: null,
-      role: 'admin', isAdmin: true, permissions: permissionsFor('admin'), targetEntities: [], isActive: true };
+      role: 'admin', isAdmin: true, permissions: permissionsFor('admin'), targetEntities: [], salesGroups: null, isActive: true };
     const reader = { ...admin, id: randomUUID() };
     const foreign = { ...reader, tenantId: randomUUID() };
     const savedAdmin = await store.createUser(admin);
@@ -163,7 +163,7 @@ test('user lifecycle, entity grants, and custom roles persist with administrator
     assert.deepEqual(savedReader.targetEntities, []);
     await pool.query("UPDATE users SET role = 'admin' WHERE id = $1", [savedAdmin.id]);
 
-    const role = { name: 'sales-reader', description: 'Selected sales only', permissions: ['sales:read'] as const };
+    const role = { name: 'sales-reader', description: 'Selected sales only', permissions: ['sales:read'] as const, salesGroups: null };
     assert.deepEqual(await store.createRole(admin, role), role);
     await assert.rejects(store.createRole(admin, role), { status: 409 });
     await assert.rejects(store.createRole(admin, { ...role, name: 'admin' }), { status: 409 });
@@ -216,6 +216,53 @@ test('user lifecycle, entity grants, and custom roles persist with administrator
     await assert.rejects(store.deleteRole(admin, role.name), { status: 403 });
     await assert.rejects(store.updateUser(admin, savedReader.id, { isActive: true }), { status: 403 });
     await assert.rejects(store.deleteUser(admin, savedReader.id), { status: 403 });
+  } finally {
+    await pool.query(`DROP SCHEMA IF EXISTS ${schema} CASCADE`);
+    await pool.end();
+  }
+});
+
+test('revenue configuration, audit, optimistic locking and role scopes persist across schema initialization', { skip: !process.env.TEST_DATABASE_URL }, async () => {
+  const schema = `ags_test_${randomUUID().replaceAll('-', '')}`;
+  const pool = new pg.Pool({ connectionString: process.env.TEST_DATABASE_URL, max: 2, options: `-c search_path=${schema}` });
+  try {
+    await pool.query(`CREATE SCHEMA ${schema}`);
+    const ddl = await readFile(new URL('../src/schema.sql', import.meta.url), 'utf8');
+    // Upgrade a real pre-grouping installation with an existing custom sales role.
+    await pool.query(ddl.slice(0, ddl.indexOf('-- Stable revenue group IDs')));
+    await pool.query("INSERT INTO roles (name, description, permissions) VALUES ('legacy-reader', 'Existing reader', ARRAY['sales:read'])");
+    await pool.query(ddl);
+    const store = createStore(pool);
+    assert.equal((await store.listRoles()).find(role => role.name === 'legacy-reader')?.salesGroups, null);
+    const admin: AuthenticatedUser = { id: randomUUID(), tenantId: randomUUID(), displayName: 'Admin', email: null,
+      role: 'admin', isAdmin: true, permissions: permissionsFor('admin'), targetEntities: [], salesGroups: null, isActive: true };
+    const saved = await store.createUser(admin);
+    await pool.query("UPDATE users SET role = 'admin' WHERE id = $1", [saved.id]);
+    const initial = await store.getRevenueConfiguration('agritehnica');
+    assert.equal(initial.enabled, true);
+    assert.equal(initial.defaultGroupId, 'piese');
+    assert.equal(initial.rules.length, 5);
+    assert.equal((await store.getRevenueConfiguration('green')).enabled, false);
+    assert.equal((await store.getRevenueConfiguration('babyhub')).enabled, false);
+    const input = { enabled: true, revision: 1, defaultGroupId: 'other' as const, rules: initial.rules.slice(0, 2) };
+    const changed = await store.updateRevenueConfiguration(admin, 'agritehnica', input);
+    assert.equal(changed.revision, 2);
+    await assert.rejects(store.updateRevenueConfiguration(admin, 'agritehnica', input), { status: 409 });
+    assert.equal((await pool.query('SELECT COUNT(*)::int AS count FROM revenue_configuration_changes')).rows[0].count, 1);
+    const newRole = await store.createRole(admin, { name: 'new-reader', description: 'New', permissions: ['sales:read'] });
+    assert.deepEqual(newRole.salesGroups, []);
+    const restricted = await store.updateRoleSalesGroups(admin, 'legacy-reader', ['utilaje']);
+    assert.deepEqual(restricted?.salesGroups, ['utilaje']);
+    await pool.query(ddl);
+    assert.deepEqual(await createStore(pool).getRevenueConfiguration('agritehnica'), changed);
+    assert.deepEqual((await store.listRoles()).find(role => role.name === 'legacy-reader')?.salesGroups, ['utilaje']);
+    assert.deepEqual((await store.listRoles()).find(role => role.name === 'new-reader')?.salesGroups, []);
+    await assert.rejects(store.updateRoleSalesGroups(admin, 'admin', []), { status: 409 });
+    await assert.rejects(pool.query("UPDATE roles SET sales_groups = ARRAY['unknown'] WHERE name = 'new-reader'"), { code: '23514' });
+    // Revoking the actor in PostgreSQL also blocks stale admin objects.
+    await pool.query('UPDATE users SET is_active = FALSE WHERE id = $1', [saved.id]);
+    await assert.rejects(store.updateRevenueConfiguration(admin, 'agritehnica', { ...input, revision: 2 }), { status: 403 });
+    await assert.rejects(store.updateRoleSalesGroups(admin, 'legacy-reader', null), { status: 403 });
   } finally {
     await pool.query(`DROP SCHEMA IF EXISTS ${schema} CASCADE`);
     await pool.end();

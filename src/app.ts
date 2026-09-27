@@ -11,6 +11,7 @@ import { isRecord, isRequestPriority, isRequestStatus, isTargetEntity } from './
 import { assignablePermissions, isRoleName, permissionsFor, requirePermission } from './permissions.js';
 import type { BorgFetch } from './borg.js';
 import { createSalesClient, parseSalesQuery } from './sales.js';
+import { classifySales, parseRevenueUpdate, parseSalesGroups, salesAccessVersion, visibleRevenueGroups } from './revenue.js';
 import { createStockClient, parseStockQuery } from './stock.js';
 
 interface AppOptions {
@@ -90,6 +91,7 @@ export function createApp({ config, store, fetchGraph, fetchBorg, rateLimitMax =
     user.role = access?.role ?? 'user';
     user.permissions = access?.permissions ?? permissionsFor('user');
     user.targetEntities = access?.targetEntities ?? [];
+    user.salesGroups = access ? access.salesGroups : [];
     user.isActive = access?.isActive ?? true;
     user.isAdmin = user.role === 'admin';
     next();
@@ -102,7 +104,42 @@ export function createApp({ config, store, fetchGraph, fetchBorg, rateLimitMax =
   api.get('/borg/sales', requirePermission('sales:read'), async (req, res) => {
     const query = parseSalesQuery(req.query);
     requireEntity(req, query.targetEntity);
-    res.json(await fetchSales(query));
+    const user = authenticatedUser(req);
+    const grouping = await store.getRevenueConfiguration(query.targetEntity);
+    const groups = grouping.enabled ? visibleRevenueGroups(user, grouping.groups) : [];
+    if ((user.salesGroups !== null && !groups.length)
+      || (query.revenueGroupId && !groups.some(group => group.id === query.revenueGroupId))) {
+      throw new HttpError(403, 'Your role does not have access to the requested revenue groups.');
+    }
+    const raw = await fetchSales(query);
+    const allowed = new Set(groups.map(group => group.id));
+    const lines = classifySales(raw, grouping).filter(line =>
+      (user.salesGroups === null || (line.revenueGroupId !== null && allowed.has(line.revenueGroupId)))
+      && (!query.revenueGroupId || line.revenueGroupId === query.revenueGroupId));
+    res.json(query.responseFormat === 'grouped'
+      ? { lines, possiblyTruncated: raw.length >= query.limit, accessVersion: salesAccessVersion(user, grouping) }
+      : lines);
+  });
+  api.get('/revenue-groups', requirePermission('sales:read'), async (req, res) => {
+    if (Object.keys(req.query).some(key => key !== 'targetEntity') || !isTargetEntity(req.query.targetEntity)) {
+      throw new HttpError(400, 'Provide a supported targetEntity.');
+    }
+    const entity = req.query.targetEntity;
+    requireEntity(req, entity);
+    const user = authenticatedUser(req);
+    const grouping = await store.getRevenueConfiguration(entity);
+    const groups = grouping.enabled ? visibleRevenueGroups(user, grouping.groups) : [];
+    if (user.salesGroups !== null && !groups.length) throw new HttpError(403, 'Your role does not have access to revenue groups for this entity.');
+    res.json({ groups, accessVersion: salesAccessVersion(user, grouping) });
+  });
+  api.get('/admin/revenue-groups/:entity', requirePermission('users:roles:update'), async (req, res) => {
+    if (!isTargetEntity(req.params.entity)) throw new HttpError(400, 'Unknown entity.');
+    res.json(await store.getRevenueConfiguration(req.params.entity));
+  });
+  api.patch('/admin/revenue-groups/:entity', requirePermission('users:roles:update'), async (req, res) => {
+    if (!isTargetEntity(req.params.entity)) throw new HttpError(400, 'Unknown entity.');
+    const input = parseRevenueUpdate(req.body);
+    res.json(await store.updateRevenueConfiguration(authenticatedUser(req), req.params.entity, input));
   });
   api.get('/borg/stock', requirePermission('stock:read'), async (req, res) => {
     const query = parseStockQuery(req.query);
@@ -129,7 +166,7 @@ export function createApp({ config, store, fetchGraph, fetchBorg, rateLimitMax =
   });
   api.post('/roles', requirePermission('users:roles:update'), async (req, res) => {
     const body: unknown = req.body;
-    bodyFields(body, ['name', 'description', 'permissions']);
+    bodyFields(body, ['name', 'description', 'permissions', 'salesGroups']);
     if (!isRoleName(body.name)) throw new HttpError(400, 'Role name must be 1–50 lowercase letters, digits, underscores or hyphens, starting with a letter.');
     const description = textField(body.description, 'description', 500);
     const permissions = body.permissions === undefined ? [] : body.permissions;
@@ -137,8 +174,16 @@ export function createApp({ config, store, fetchGraph, fetchBorg, rateLimitMax =
       || new Set(permissions).size !== permissions.length) {
       throw new HttpError(400, 'permissions must be a unique array of supported data permissions.');
     }
-    const role = await store.createRole(authenticatedUser(req), { name: body.name, description, permissions });
+    const role = await store.createRole(authenticatedUser(req), { name: body.name, description, permissions, salesGroups: parseSalesGroups(body.salesGroups) });
     res.status(201).location(`/api/roles/${role.name}`).json({ role });
+  });
+  api.patch<{ name: string }>('/roles/:name/sales-groups', requirePermission('users:roles:update'), async (req, res) => {
+    if (!isRoleName(req.params.name)) throw new HttpError(400, 'Invalid role name.');
+    bodyFields(req.body, ['salesGroups']);
+    if (!('salesGroups' in req.body)) throw new HttpError(400, 'Provide salesGroups.');
+    const role = await store.updateRoleSalesGroups(authenticatedUser(req), req.params.name, parseSalesGroups(req.body.salesGroups));
+    if (!role) throw new HttpError(404, 'Role not found.');
+    res.json({ role });
   });
   api.delete<{ name: string }>('/roles/:name', requirePermission('users:roles:update'), async (req, res) => {
     if (!isRoleName(req.params.name)) throw new HttpError(400, 'Invalid role name.');

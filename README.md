@@ -76,11 +76,11 @@ Every `/api/*` request requires `Authorization: Bearer YOUR_GRAPH_ACCESS_TOKEN`.
 | Method | Path | Result |
 | --- | --- | --- |
 | GET | `/health` | Public database health check; `200` healthy, `503` unavailable |
-| GET | `/api/me` | `{ user: { id, tenantId, displayName, email, role, isAdmin, permissions, targetEntities, isActive } }` |
+| GET | `/api/me` | `{ user: { id, tenantId, displayName, email, role, isAdmin, permissions, salesGroups, targetEntities, isActive } }` |
 | POST | `/api/users` | Create or refresh your database user from Microsoft; returns `200` and `{ user }` |
 | GET | `/api/users` | Admin only: list users in your organization with `limit` and `offset` |
 | GET | `/api/roles` | Admin only: `{ roles, assignablePermissions }` |
-| POST | `/api/roles` | Admin only: create `{ name, description, permissions? }`; returns `201` and `{ role }` |
+| POST | `/api/roles` | Admin only: create `{ name, description, permissions?, salesGroups? }`; returns `201` and `{ role }` |
 | DELETE | `/api/roles/:name` | Admin only: delete an unassigned custom role; returns `204` |
 | PATCH | `/api/users/:id/role` | Admin only: assign `{ "role": "existing-role-name" }` using the database user ID |
 | PATCH | `/api/users/:id` | Admin only: replace `targetEntities` and/or set `isActive`; returns `{ user }` |
@@ -259,9 +259,83 @@ const lines = data; // Plain array, including [] when no sales match.
 
 The interval may include **at most 30 calendar days, counting both endpoints**, and must stay in one calendar year. September 1–30 is valid; August 1–31 is not. Ranges can cross month boundaries within the same year if they still fit within 30 days. Split longer ranges into non-overlapping requests. Invalid, repeated, or unknown query parameters return `400` before contacting Borg.
 
-Product lines, negative return quantities/values, nullable invoice fields, costs, and margins are passed through without aggregation or database storage. The response has no wrapper, totals, or truncation flag. If `lines.length === limit`, treat the result as potentially truncated and raise the limit or narrow the interval before computing dashboard totals. Requests are not automatically retried or paginated, and responses have `Cache-Control: no-store`.
+Sales lines are classified by the saved revenue rules and filtered to the caller's allowed groups. Original amounts, returns, nullable fields, costs, and margins are preserved without aggregation or sales-line database storage. Use `responseFormat=grouped` for explicit truncation metadata; array length after access filtering does not reliably indicate completeness. Requests are not automatically retried or paginated, and responses have `Cache-Control: no-store`.
 
 The upstream call times out after 30 seconds (`504`) and does not follow redirects. An upstream `400` becomes a sanitized `400`; throttling or temporary unavailability becomes `503`; other upstream HTTP, connection, or malformed-response failures become `502`. Upstream error bodies and credentials are never returned to the frontend. `401`/`403` from Borg become `502` because they indicate a backend integration problem, not a failed Microsoft login.
+
+
+## Revenue groups and sales access
+
+Startup seeds five stable groups and Agritehnica category rules:
+
+| Borg `grupa` | Group ID / label |
+| --- | --- |
+| Utilaje | `utilaje` / Utilaje |
+| Irigații | `irigatii` / Irigații |
+| Alte materiale consumabile, Cheltuieli Diverse | `other` / Other |
+| Manipulare | `manopera` / Manoperă |
+| All remaining or missing categories | `piese` / Piese |
+
+Matches use the entire category and ignore accents, case, and repeated whitespace.
+Green and BabyHub start with grouping disabled. Saved edits are never overwritten
+on restart. Each sales line belongs to one group; signed return values are preserved.
+Current mappings also classify historical sales on the next load.
+
+### Configuration
+
+`GET /api/admin/revenue-groups/:entity` (admin only) returns `targetEntity`,
+`enabled`, `revision`, `defaultGroupId`, `rules`, and the `groups` catalog.
+`PATCH` on the same path accepts the complete `{ enabled, revision, defaultGroupId,
+rules: [{ category, groupId }] }`. Duplicate normalized categories are rejected.
+A stale revision returns `409`. Updates recheck the administrator in PostgreSQL
+and record before/after configuration, actor, tenant, and timestamp atomically.
+
+`revenue_groups`, `revenue_configurations`, and `revenue_configuration_changes`
+are protected from public Data API access with RLS, like the role/user tables.
+The five catalog IDs are fixed; administrators edit category assignments and the
+fallback group through the configuration endpoint.
+
+### Role scopes
+
+Roles and `/api/me` expose `salesGroups`: `null` grants all groups; an array grants
+only those IDs; `[]` grants no sales. Role creation accepts this field (default
+`[]`). Admins can change a custom role using
+`PATCH /api/roles/:name/sales-groups` with `{ "salesGroups": ["utilaje"] }`.
+Built-in role scopes cannot be changed through this endpoint.
+
+Sales requires `sales:read`, the user's entity grant, and an allowed revenue group.
+Selected groups apply across granted entities where grouping is enabled. Entities
+without grouping require `salesGroups: null`. Scope does not grant entities and
+does not change stock/support permissions. Changes take effect on the next request.
+
+The schema upgrade sets existing roles to unrestricted group access once, preserving
+their current access. Subsequent schema runs keep saved restrictions. New database
+role rows default to `[]`; trusted operators must explicitly select a scope.
+
+### Sales response
+
+`GET /api/revenue-groups?targetEntity=...` requires sales/entity access and returns
+only the caller's allowed `{ groups, accessVersion }`. It returns `403` when no
+groups are allowed, or `groups: []` for an unrestricted role on an ungrouped entity.
+The version binds identity, role, permissions, entity grants, group grants, entity,
+and configuration revision.
+
+`GET /api/borg/sales` also accepts:
+
+- `revenueGroupId`: an optional allowed group to narrow results; forbidden IDs
+  return `403`, unknown IDs return `400`.
+- `responseFormat=grouped`: returns `{ lines, possiblyTruncated, accessVersion }`.
+
+Lines include server-owned `revenueGroupId` and `revenueGroupName`, both null when
+grouping is disabled. Without the format option, the legacy array shape remains,
+with these additional fields. Every response format enforces the same scope.
+`possiblyTruncated` is calculated from the original upstream response before
+filtering, so hidden rows cannot conceal an incomplete dataset. No hidden group
+counts or totals are exposed. Clients should use the grouped format and compare
+access versions across chunks/comparison periods.
+
+Deploy this backend before the updated frontend. Startup applies the idempotent
+schema upgrade; no separate production migration command is required.
 
 ## Deploy on Render
 

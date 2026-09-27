@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import type { Pool, PoolClient } from 'pg';
+import type { RevenueConfiguration } from './revenue.js';
 import type { AuthenticatedUser, Store, StoredRole, StoredUser, SupportRequest, UserAccess } from './types.js';
 import { hasPermission, isRole } from './permissions.js';
 import { HttpError } from './errors.js';
@@ -38,24 +39,57 @@ export function createStore(pool: Pool): Store {
     }
   }
 
+  const roleFields = 'name, description, permissions, sales_groups AS "salesGroups"';
+  async function revenueConfig(entity: string, client: Pool | PoolClient = pool): Promise<RevenueConfiguration> {
+    const { rows } = await client.query<RevenueConfiguration>(`SELECT target_entity AS "targetEntity", enabled, revision,
+      default_group_id AS "defaultGroupId", rules,
+      (SELECT jsonb_agg(jsonb_build_object('id', id, 'name', name) ORDER BY position) FROM revenue_groups) AS groups
+      FROM revenue_configurations WHERE target_entity = $1`, [entity]);
+    if (!rows[0]) throw new HttpError(503, 'Revenue grouping configuration is unavailable.');
+    return rows[0];
+  }
+
   return {
+    getRevenueConfiguration: revenueConfig,
+    async updateRevenueConfiguration(user, entity, input) {
+      return asAdmin(user, async client => {
+        await client.query('SELECT target_entity FROM revenue_configurations WHERE target_entity = $1 FOR UPDATE', [entity]);
+        const previous = await revenueConfig(entity, client);
+        if (previous.revision !== input.revision) throw new HttpError(409, 'Grouping changed. Reload the configuration before saving.');
+        await client.query(`UPDATE revenue_configurations SET enabled = $2, default_group_id = $3,
+          rules = $4::jsonb, revision = revision + 1 WHERE target_entity = $1`,
+        [entity, input.enabled, input.defaultGroupId, JSON.stringify(input.rules)]);
+        const next = await revenueConfig(entity, client);
+        await client.query(`INSERT INTO revenue_configuration_changes (target_entity, tenant_id, actor_id, previous, next)
+          VALUES ($1, $2, $3, $4::jsonb, $5::jsonb)`,
+        [entity, user.tenantId, user.id, JSON.stringify(previous), JSON.stringify(next)]);
+        return next;
+      });
+    },
+    async updateRoleSalesGroups(user, name, groups) {
+      return asAdmin(user, async client => {
+        if (isRole(name)) throw new HttpError(409, 'Built-in role access cannot be changed.');
+        const { rows } = await client.query<StoredRole>(`UPDATE roles SET sales_groups = $2 WHERE name = $1 RETURNING ${roleFields}`, [name, groups]);
+        return rows[0];
+      });
+    },
     async health() { await pool.query('SELECT 1'); },
     async getUserAccess(user) {
-      const { rows } = await pool.query<UserAccess>(`SELECT u.role, r.permissions,
+      const { rows } = await pool.query<UserAccess>(`SELECT u.role, r.permissions, r.sales_groups AS "salesGroups",
         u.target_entities AS "targetEntities", u.is_active AS "isActive", u.deleted_at AS "deletedAt"
         FROM users u JOIN roles r ON r.name = u.role
         WHERE u.tenant_id = $1 AND u.microsoft_user_id = $2`, [user.tenantId, user.id]);
       return rows[0];
     },
     async listRoles() {
-      return (await pool.query<StoredRole>('SELECT name, description, permissions FROM roles ORDER BY name')).rows;
+      return (await pool.query<StoredRole>(`SELECT ${roleFields} FROM roles ORDER BY name`)).rows;
     },
     async createRole(user, input) {
       return asAdmin(user, async client => {
         if (isRole(input.name)) throw new HttpError(409, 'Built-in roles cannot be replaced.');
-        const { rows } = await client.query<StoredRole>(`INSERT INTO roles (name, description, permissions)
-          VALUES ($1, $2, $3) RETURNING name, description, permissions`,
-        [input.name, input.description, input.permissions]);
+        const { rows } = await client.query<StoredRole>(`INSERT INTO roles (name, description, permissions, sales_groups)
+          VALUES ($1, $2, $3, $4) RETURNING ${roleFields}`,
+        [input.name, input.description, input.permissions, input.salesGroups === undefined ? [] : input.salesGroups]);
         return rows[0]!;
       });
     },
