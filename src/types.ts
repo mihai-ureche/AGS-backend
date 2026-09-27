@@ -1,4 +1,5 @@
 import type { Permission } from './permissions.js';
+import type { RevenueConfiguration, RevenueGroupId, RevenueUpdate } from './revenue.js';
 
 export interface AppConfig {
   tenantId: string;
@@ -20,6 +21,7 @@ export interface AuthenticatedUser {
   isAdmin: boolean;
   role: Role;
   permissions: readonly Permission[];
+  salesGroups: RevenueGroupId[] | null;
   targetEntities: TargetEntity[];
   isActive: boolean;
 }
@@ -29,6 +31,7 @@ export type TargetEntity = 'agritehnica' | 'green' | 'babyhub';
 export interface UserAccess {
   role: Role;
   permissions: readonly Permission[];
+  salesGroups: RevenueGroupId[] | null;
   targetEntities: TargetEntity[];
   isActive: boolean;
   deletedAt: Date | null;
@@ -41,6 +44,7 @@ export interface StoredRole {
   name: Role;
   description: string;
   permissions: readonly Permission[];
+  salesGroups: RevenueGroupId[] | null;
 }
 
 export interface StoredUser {
@@ -86,7 +90,10 @@ export interface RequestPage {
 export interface Store {
   health(): Promise<void>;
   getUserAccess(user: AuthenticatedUser): Promise<UserAccess | undefined>;
-  createRole(user: AuthenticatedUser, input: StoredRole): Promise<StoredRole>;
+  createRole(user: AuthenticatedUser, input: Omit<StoredRole, 'salesGroups'> & { salesGroups?: RevenueGroupId[] | null }): Promise<StoredRole>;
+  updateRoleSalesGroups(user: AuthenticatedUser, name: string, groups: RevenueGroupId[] | null): Promise<StoredRole | undefined>;
+  getRevenueConfiguration(entity: TargetEntity): Promise<RevenueConfiguration>;
+  updateRevenueConfiguration(user: AuthenticatedUser, entity: TargetEntity, input: RevenueUpdate): Promise<RevenueConfiguration>;
   deleteRole(user: AuthenticatedUser, name: string): Promise<boolean>;
   updateUser(user: AuthenticatedUser, id: string, input: UserUpdate): Promise<StoredUser | undefined>;
   deleteUser(user: AuthenticatedUser, id: string): Promise<boolean>;

@@ -1,3 +1,5 @@
+import { isRevenueGroupId } from './revenue.js';
+import type { RevenueGroupId } from './revenue.js';
 import { requestBorg } from './borg.js';
 import type { BorgFetch } from './borg.js';
 import { HttpError } from './errors.js';
@@ -9,6 +11,8 @@ export interface SalesQuery {
   from: string;
   to: string;
   gestiune?: number;
+  revenueGroupId?: RevenueGroupId;
+  responseFormat?: 'grouped';
   docType?: 'BFD' | 'AIM';
   limit: number;
   includeTransfers: boolean;
@@ -37,12 +41,14 @@ function positiveInteger(value: unknown, field: string, max: number): number {
 }
 
 export function parseSalesQuery(query: Record<string, unknown>): SalesQuery {
-  const allowed = ['targetEntity', 'from', 'to', 'gestiune', 'docType', 'limit', 'includeTransfers'];
+  const allowed = ['targetEntity', 'from', 'to', 'gestiune', 'docType', 'limit', 'includeTransfers', 'revenueGroupId', 'responseFormat'];
   if (Object.keys(query).some(key => !allowed.includes(key))) throw new HttpError(400, 'Unsupported sales query parameter.');
   const { targetEntity, docType, includeTransfers } = query;
   if (!isTargetEntity(targetEntity)) {
     throw new HttpError(400, 'targetEntity must be agritehnica, green, or babyhub.');
   }
+  if (query.revenueGroupId !== undefined && !isRevenueGroupId(query.revenueGroupId)) throw new HttpError(400, 'Unknown revenue group.');
+  if (query.responseFormat !== undefined && query.responseFormat !== 'grouped') throw new HttpError(400, 'Unsupported response format.');
   const from = date(query.from, 'from');
   const to = date(query.to, 'to');
   const days = (to.timestamp - from.timestamp) / 86_400_000 + 1;
@@ -55,6 +61,8 @@ export function parseSalesQuery(query: Record<string, unknown>): SalesQuery {
   }
   return {
     targetEntity, from: from.text, to: to.text, docType,
+    revenueGroupId: query.revenueGroupId as RevenueGroupId | undefined,
+    responseFormat: query.responseFormat as 'grouped' | undefined,
     gestiune: query.gestiune === undefined ? undefined : positiveInteger(query.gestiune, 'gestiune', Number.MAX_SAFE_INTEGER),
     limit: query.limit === undefined ? 5000 : positiveInteger(query.limit, 'limit', 50000),
     includeTransfers: includeTransfers === 'true',

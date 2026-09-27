@@ -58,3 +58,53 @@ CREATE INDEX IF NOT EXISTS support_requests_owner_idx
   ON support_requests (tenant_id, owner_id, created_at DESC, id DESC);
 CREATE INDEX IF NOT EXISTS support_requests_tenant_idx
   ON support_requests (tenant_id, created_at DESC, id DESC);
+
+-- Stable revenue group IDs are shared by reports and role grants.
+CREATE TABLE IF NOT EXISTS revenue_groups (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  position INTEGER NOT NULL
+);
+ALTER TABLE revenue_groups ENABLE ROW LEVEL SECURITY;
+INSERT INTO revenue_groups (id, name, position) VALUES
+  ('utilaje', 'Utilaje', 1), ('irigatii', 'Irigații', 2), ('piese', 'Piese', 3),
+  ('manopera', 'Manoperă', 4), ('other', 'Other', 5)
+ON CONFLICT (id) DO NOTHING;
+
+CREATE TABLE IF NOT EXISTS revenue_configurations (
+  target_entity TEXT PRIMARY KEY CHECK (target_entity IN ('agritehnica', 'green', 'babyhub')),
+  enabled BOOLEAN NOT NULL DEFAULT FALSE,
+  revision INTEGER NOT NULL DEFAULT 1 CHECK (revision > 0),
+  default_group_id TEXT NOT NULL REFERENCES revenue_groups(id),
+  rules JSONB NOT NULL DEFAULT '[]' CHECK (jsonb_typeof(rules) = 'array')
+);
+ALTER TABLE revenue_configurations ENABLE ROW LEVEL SECURITY;
+INSERT INTO revenue_configurations (target_entity, enabled, default_group_id, rules) VALUES
+  ('agritehnica', TRUE, 'piese', '[
+    {"category":"Utilaje","groupId":"utilaje"},
+    {"category":"Irigații","groupId":"irigatii"},
+    {"category":"Alte materiale consumabile","groupId":"other"},
+    {"category":"Cheltuieli Diverse","groupId":"other"},
+    {"category":"Manipulare","groupId":"manopera"}
+  ]'),
+  ('green', FALSE, 'other', '[]'),
+  ('babyhub', FALSE, 'other', '[]')
+ON CONFLICT (target_entity) DO NOTHING;
+
+CREATE TABLE IF NOT EXISTS revenue_configuration_changes (
+  id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  target_entity TEXT NOT NULL REFERENCES revenue_configurations(target_entity),
+  tenant_id UUID NOT NULL,
+  actor_id UUID NOT NULL,
+  changed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  previous JSONB NOT NULL,
+  next JSONB NOT NULL
+);
+ALTER TABLE revenue_configuration_changes ENABLE ROW LEVEL SECURITY;
+
+-- ADD COLUMN backfills existing roles with explicit unrestricted access once.
+-- Subsequent startups never reset saved scopes. New roles default to no groups.
+ALTER TABLE roles ADD COLUMN IF NOT EXISTS sales_groups TEXT[] DEFAULT NULL
+  CHECK (sales_groups <@ ARRAY['utilaje', 'irigatii', 'piese', 'manopera', 'other']::text[]
+    AND array_position(sales_groups, NULL) IS NULL);
+ALTER TABLE roles ALTER COLUMN sales_groups SET DEFAULT '{}';
