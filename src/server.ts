@@ -3,8 +3,10 @@ import pg from 'pg';
 import { createApp } from './app.js';
 import { readConfig } from './config.js';
 import { createStore } from './store.js';
+import { readSalesReconciliations } from './salesReconciliation.js';
 
 const config = readConfig();
+const reconciliations = await readSalesReconciliations(config.salesReconciliationFile);
 const pool = new pg.Pool({
   connectionString: config.databaseUrl,
   max: 10,
@@ -22,7 +24,7 @@ try {
   process.exit(1);
 }
 
-const app = createApp({ config, store: createStore(pool) });
+const app = createApp({ config, store: createStore(pool), reconciliations });
 const server = app.listen(config.port, '0.0.0.0', () => {
   console.log(`AGS support API listening on port ${config.port}`);
 });
