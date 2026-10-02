@@ -13,6 +13,8 @@ import type { BorgFetch } from './borg.js';
 import { createSalesClient, parseSalesQuery } from './sales.js';
 import { classifySales, parseRevenueUpdate, parseSalesGroups, salesAccessVersion, visibleRevenueGroups } from './revenue.js';
 import { createStockClient, parseStockQuery } from './stock.js';
+import { reconcileSales, reconciliationVersion } from './salesReconciliation.js';
+import type { SalesReconciliation } from './salesReconciliation.js';
 
 interface AppOptions {
   config: AppConfig;
@@ -20,6 +22,7 @@ interface AppOptions {
   fetchGraph?: GraphFetch;
   fetchBorg?: BorgFetch;
   rateLimitMax?: number;
+  reconciliations?: SalesReconciliation[];
 }
 
 function bodyFields(body: unknown, allowed: string[]): asserts body is Record<string, unknown> {
@@ -48,7 +51,7 @@ function requireEntity(req: Request, entity: TargetEntity) {
   }
 }
 
-export function createApp({ config, store, fetchGraph, fetchBorg, rateLimitMax = 120 }: AppOptions) {
+export function createApp({ config, store, fetchGraph, fetchBorg, rateLimitMax = 120, reconciliations = [] }: AppOptions) {
   const app = express();
   const fetchSales = createSalesClient(config.borg, fetchBorg);
   const fetchStock = createStockClient(config.borg, fetchBorg);
@@ -113,11 +116,17 @@ export function createApp({ config, store, fetchGraph, fetchBorg, rateLimitMax =
     }
     const raw = await fetchSales(query);
     const allowed = new Set(groups.map(group => group.id));
-    const lines = classifySales(raw, grouping).filter(line =>
+    const reconciled = reconcileSales(classifySales(raw, grouping), query, grouping, reconciliations);
+    const authorized = reconciled.lines.filter(line =>
       (user.salesGroups === null || (line.revenueGroupId !== null && allowed.has(line.revenueGroupId)))
       && (!query.revenueGroupId || line.revenueGroupId === query.revenueGroupId));
+    const lines = authorized.slice(0, query.limit);
+    const reports = reconciled.reports.filter(report => allowed.has(report.groupId)
+      && (!query.revenueGroupId || query.revenueGroupId === report.groupId));
     res.json(query.responseFormat === 'grouped'
-      ? { lines, possiblyTruncated: raw.length >= query.limit, accessVersion: salesAccessVersion(user, grouping) }
+      ? { lines, possiblyTruncated: raw.length >= query.limit || authorized.length > query.limit,
+        accessVersion: salesAccessVersion(user, grouping, reconciliationVersion(reconciliations, grouping)),
+        ...(reports.length ? { reconciliations: reports } : {}) }
       : lines);
   });
   api.get('/revenue-groups', requirePermission('sales:read'), async (req, res) => {
@@ -130,7 +139,7 @@ export function createApp({ config, store, fetchGraph, fetchBorg, rateLimitMax =
     const grouping = await store.getRevenueConfiguration(entity);
     const groups = grouping.enabled ? visibleRevenueGroups(user, grouping.groups) : [];
     if (user.salesGroups !== null && !groups.length) throw new HttpError(403, 'Your role does not have access to revenue groups for this entity.');
-    res.json({ groups, accessVersion: salesAccessVersion(user, grouping) });
+    res.json({ groups, accessVersion: salesAccessVersion(user, grouping, reconciliationVersion(reconciliations, grouping)) });
   });
   api.get('/admin/revenue-groups/:entity', requirePermission('users:roles:update'), async (req, res) => {
     if (!isTargetEntity(req.params.entity)) throw new HttpError(400, 'Unknown entity.');
