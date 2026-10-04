@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readConfig } from '../src/config.js';
-import { createSalesClient, parseSalesQuery } from '../src/sales.js';
+import { createSalesClient, createSalesPageClient, parseSalesQuery } from '../src/sales.js';
 
 const base = { targetEntity: 'babyhub', from: '2026-09-01', to: '2026-09-30' };
 const borg = { baseUrl: 'https://borg.example/api2/borg', authorization: 'Bearer private-borg-token' };
@@ -35,8 +35,21 @@ test('sales rejects missing, repeated, unknown, and invalid filters', () => {
     { gestiune: '0' }, { gestiune: '-1' }, { gestiune: '1.5' }, { gestiune: '1e2' }, { gestiune: '9007199254740992' },
     { limit: '0' }, { limit: '50001' }, { limit: ['5', '10'] }, { limit: '1.5' },
     { includeTransfers: '1' }, { includeTransfers: true }, { includeTransfers: ['true', 'false'] },
+    { responseFormat: 'prepared' }, { responseFormat: ['grouped'] }, { responseFormat: ['grouped', 'prepared'] },
     { url: 'https://other.example' }, { authorization: 'attacker-token' },
   ]) assert.throws(() => parseSalesQuery({ ...base, ...patch }), { status: 400 });
+});
+
+test('sales forwards AIMS without forwarding backend response options', async () => {
+  const query = parseSalesQuery({ ...base, targetEntity: 'agritehnica', docType: 'AIMS', responseFormat: 'grouped' });
+  const sales = createSalesClient(borg, async address => {
+    const params = new URL(address).searchParams;
+    assert.equal(params.get('docType'), 'AIMS');
+    assert.equal(params.has('responseFormat'), false);
+    assert.equal(params.get('envelope'), 'true');
+    return Response.json([]);
+  });
+  assert.deepEqual(await sales(query), []);
 });
 
 test('sales forwards every validated filter and only the server credential', async () => {
@@ -47,7 +60,7 @@ test('sales forwards every validated filter and only the server credential', asy
       assert.equal(url.origin, 'https://borg.example');
       assert.equal(url.pathname, '/api2/borg/sales');
       assert.deepEqual(Object.fromEntries(url.searchParams), {
-        targetEntity, from: base.from, to: base.to, gestiune: '2', docType: 'AIM', limit: '50000', includeTransfers: 'true',
+        targetEntity, from: base.from, to: base.to, gestiune: '2', docType: 'AIM', limit: '50000', includeTransfers: 'true', envelope: 'true',
       });
       assert.equal(init.method, 'GET');
       assert.equal(init.redirect, 'error');
@@ -56,6 +69,22 @@ test('sales forwards every validated filter and only the server credential', asy
       return Response.json(lines);
     });
     assert.deepEqual(await sales(parseSalesQuery({ ...base, targetEntity, gestiune: '2', docType: 'AIM', limit: '50000', includeTransfers: 'true' })), lines);
+  }
+});
+
+test('sales consumes exact BORG truncation metadata and keeps the row-array client compatible', async () => {
+  const lines = [{ miscareId: 1, tipLinie: 'produs', valoareNet: 90 }];
+  const query = { ...parseSalesQuery(base), limit: 1 };
+  for (const truncated of [false, true]) {
+    const fetchBorg = async () => Response.json({
+      meta: { truncated, control: { documentsChecked: 99 }, warnings: ['internal report detail'] }, lines,
+    });
+    assert.deepEqual(await createSalesPageClient(borg, fetchBorg)(query), { lines, possiblyTruncated: truncated });
+    assert.deepEqual(await createSalesClient(borg, fetchBorg)(query), lines);
+  }
+  assert.deepEqual(await createSalesPageClient(borg, async () => Response.json(lines))(query), { lines, possiblyTruncated: true });
+  for (const meta of [undefined, null, {}, { truncated: 'false' }]) {
+    await assert.rejects(createSalesPageClient(borg, async () => Response.json({ meta, lines }))(query), { status: 502 });
   }
 });
 
