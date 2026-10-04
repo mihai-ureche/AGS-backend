@@ -253,13 +253,13 @@ const lines = data; // Plain array, including [] when no sales match.
 | `targetEntity` | Required: `agritehnica`, `green`, or `babyhub` |
 | `from`, `to` | Required, real `YYYY-MM-DD` dates; `from <= to` |
 | `gestiune` | Optional positive safe integer warehouse ID |
-| `docType` | Optional `BFD` or `AIM`; omit for both |
+| `docType` | Optional `BFD`, `AIM`, or `AIMS`; upstream must support the requested type |
 | `limit` | Integer 1–50000; default 5000 |
 | `includeTransfers` | Literal `true` or `false`; default `false` |
 
 The interval may include **at most 30 calendar days, counting both endpoints**, and must stay in one calendar year. September 1–30 is valid; August 1–31 is not. Ranges can cross month boundaries within the same year if they still fit within 30 days. Split longer ranges into non-overlapping requests. Invalid, repeated, or unknown query parameters return `400` before contacting Borg.
 
-Sales lines are classified by the saved revenue rules and filtered to the caller's allowed groups. Original amounts, returns, nullable fields, costs, and margins are preserved without aggregation or sales-line database storage. Use `responseFormat=grouped` for explicit truncation metadata; array length after access filtering does not reliably indicate completeness. Requests are not automatically retried or paginated, and responses have `Cache-Control: no-store`.
+Sales lines are classified by the saved revenue rules and filtered to the caller's allowed groups. BORG's authoritative product amounts and signed returns pass through unchanged. Discounts allocated across multiple revenue groups become one row per group, preserving their total value and applying access filtering to each share. There is no sales aggregation or sales-line database storage. Use `responseFormat=grouped` for explicit truncation metadata; array length after access filtering does not reliably indicate completeness. Requests are not automatically retried or paginated, and responses have `Cache-Control: no-store`.
 
 The upstream call times out after 30 seconds (`504`) and does not follow redirects. An upstream `400` becomes a sanitized `400`; throttling or temporary unavailability becomes `503`; other upstream HTTP, connection, or malformed-response failures become `502`. Upstream error bodies and credentials are never returned to the frontend. `401`/`403` from Borg become `502` because they indicate a backend integration problem, not a failed Microsoft login.
 
@@ -328,11 +328,57 @@ and configuration revision.
 
 Lines include server-owned `revenueGroupId` and `revenueGroupName`, both null when
 grouping is disabled. Without the format option, the legacy array shape remains,
-with these additional fields. Every response format enforces the same scope.
-`possiblyTruncated` is calculated from the original upstream response before
-filtering, so hidden rows cannot conceal an incomplete dataset. No hidden group
+with these additional fields. All formats also include `businessValueKind`
+(`sale`, `discount`, `special`, or `unclassified`).
+Every response format enforces the same scope.
+The backend requests BORG's envelope internally and uses `meta.truncated` before
+filtering. An older BORG array response falls back to comparing its length with
+the requested limit. BORG's document totals, controls, and warnings are not
+returned by AGS. No hidden group
 counts or totals are exposed. Clients should use the grouped format and compare
 access versions across chunks/comparison periods.
+
+### Separate sales and discounts
+
+For Piese data rows, request:
+
+```text
+/api/borg/sales?targetEntity=agritehnica&from=2026-09-01&to=2026-09-30&limit=50000&includeTransfers=false&revenueGroupId=piese
+```
+
+The response is a plain array of authorized rows, with BORG's product amounts
+and discount allocations.
+The sales API does not return summaries, aggregate totals, or counts.
+`responseFormat=grouped` keeps the same rows with only access and truncation
+metadata (`lines`, `possiblyTruncated`, `accessVersion`), as used by the frontend
+loader. `responseFormat=prepared` is not supported.
+
+Use each row's `businessValueKind` to distinguish product sales, discounts,
+special/service lines, and unknown types. Any dashboard aggregation belongs in the
+frontend. Preserve signed product returns and positive discount reversals.
+Keep special and unclassified amounts separate from product sales and discounts. When using the
+grouped format, respect `possiblyTruncated` before presenting a whole-period total.
+
+With BORG 2.1, `tipLinie` is authoritative: `produs` maps to `sale`,
+`discount` to `discount`, and `special` to `special`. An explicit null or unknown
+type maps to `unclassified`. For old responses without `tipLinie`, Agritehnica
+uses the legacy `~111`, `PT CLIENTI 709`, and `DCH` code mapping and treats other
+`Discount` category rows as unclassified. BORG already corrects line discounts
+and sets `discountInclusInLinii` entries to zero; AGS does not discount them again.
+
+`alocareDiscount.grupe[].grupa` is mapped using the saved revenue rules.
+Shares assigned to the same revenue group are combined. A discount spanning
+multiple groups gets distinct `miscareId` values such as `77:discount:piese`,
+`sourceMiscareId: 77`, and `discountAllocation: true`. Each row carries only its
+group's allocation; its monetary fields are divided consistently, preserving
+the original totals. These allocation rows use quantity 1 and their allocated
+amount as unit price. Standalone `sursa: "nealocat"` discounts retain category
+grouping until their business/warehouse attribution rules are configured.
+No client exclusion is applied automatically.
+
+Revenue group IDs represent configured category groups. The supplied Piese
+report uses warehouse and document scope, which can cross these category groups.
+Reproducing that report is a separate filter from `revenueGroupId=piese`.
 
 Deploy this backend before the updated frontend. Startup applies the idempotent
 schema upgrade; no separate production migration command is required.
@@ -369,3 +415,36 @@ TEST_DATABASE_URL=postgresql://localhost/ags_test npm test
 ```
 
 The default suite mocks Microsoft Graph and tests authentication, tenant restrictions, validation, staff permissions, CORS, errors, and pagination. The database suite uses a temporary schema to verify persistence and tenant/user isolation and removes that schema afterward. Live Microsoft login requires your own tenant and frontend registration.
+
+### September 2026 sales reconciliation test
+
+Run the live check separately with the existing backend configuration in `.env`:
+
+```sh
+npm run test:sales:september
+```
+
+The test calls the local AGS `/api/borg/sales` route, reads the saved Agritehnica
+revenue rules from PostgreSQL, and fetches September 1–29 from live BORG with
+transfers excluded. It uses a test Microsoft identity and does not modify users
+or the database. It requires `BORG_API_AUTHORIZATION` and `DATABASE_URL` alongside
+the normal backend configuration.
+
+The fixed CSV targets are **5,387,882.17 lei in sales** and **227,735.06 lei in
+discounts**, excluding VAT. The baseline in `test/fixtures/september2026.json`
+contains the reports' document references and warehouses (1, 2, 6, 9, 10, 14),
+without customer details. This freezes the export snapshot instead of including
+later documents or relying on an approximate export timestamp. It does not
+introduce a production MEWI/client exclusion rule. Because report scope crosses
+category groups, the test reads all authorized groups and includes all shares
+of each matching discount.
+
+Sales include signed product returns; positive discount reversals reduce discounts.
+Special and unclassified rows are reported separately. The test requires BORG 2.1
+line types and all report documents, calculates amounts in cents, rejects possibly
+truncated data, and fails on any difference. It also checks AIM sales, AIMS returns,
+and discount reversals individually, printing expected amounts, actual amounts,
+and their deltas. These precise CSV totals differ from the initially stated rounded
+business markers by 0.10 lei in sales and 0.06 lei in discounts.
+It stays outside `npm test`, so regular tests remain independent of live data.
+The API continues to return rows without aggregate totals.

@@ -10,7 +10,8 @@ import type { AppConfig, GraphFetch, Store, TargetEntity, UserUpdate } from './t
 import { isRecord, isRequestPriority, isRequestStatus, isTargetEntity } from './validation.js';
 import { assignablePermissions, isRoleName, permissionsFor, requirePermission } from './permissions.js';
 import type { BorgFetch } from './borg.js';
-import { createSalesClient, parseSalesQuery } from './sales.js';
+import { createSalesPageClient, parseSalesQuery } from './sales.js';
+import { prepareSales } from './salesReporting.js';
 import { classifySales, parseRevenueUpdate, parseSalesGroups, salesAccessVersion, visibleRevenueGroups } from './revenue.js';
 import { createStockClient, parseStockQuery } from './stock.js';
 
@@ -50,7 +51,7 @@ function requireEntity(req: Request, entity: TargetEntity) {
 
 export function createApp({ config, store, fetchGraph, fetchBorg, rateLimitMax = 120 }: AppOptions) {
   const app = express();
-  const fetchSales = createSalesClient(config.borg, fetchBorg);
+  const fetchSales = createSalesPageClient(config.borg, fetchBorg);
   const fetchStock = createStockClient(config.borg, fetchBorg);
   app.disable('x-powered-by');
   app.set('trust proxy', config.trustProxyHops);
@@ -111,13 +112,14 @@ export function createApp({ config, store, fetchGraph, fetchBorg, rateLimitMax =
       || (query.revenueGroupId && !groups.some(group => group.id === query.revenueGroupId))) {
       throw new HttpError(403, 'Your role does not have access to the requested revenue groups.');
     }
-    const raw = await fetchSales(query);
+    const { lines: raw, possiblyTruncated } = await fetchSales(query);
     const allowed = new Set(groups.map(group => group.id));
-    const lines = classifySales(raw, grouping).filter(line =>
+    const visible = classifySales(raw, grouping).filter(line =>
       (user.salesGroups === null || (line.revenueGroupId !== null && allowed.has(line.revenueGroupId)))
       && (!query.revenueGroupId || line.revenueGroupId === query.revenueGroupId));
+    const lines = prepareSales(visible, query.targetEntity);
     res.json(query.responseFormat === 'grouped'
-      ? { lines, possiblyTruncated: raw.length >= query.limit, accessVersion: salesAccessVersion(user, grouping) }
+      ? { lines, possiblyTruncated, accessVersion: salesAccessVersion(user, grouping) }
       : lines);
   });
   api.get('/revenue-groups', requirePermission('sales:read'), async (req, res) => {

@@ -370,7 +370,7 @@ test('Borg sales returns the plain array and keeps frontend and upstream credent
     assert.ok(!url.includes('opaque-graph-token'));
     return Response.json(lines);
   } });
-  const response = await client.get(`${salesPath}&docType=BFD&gestiune=2`).set(...bearer).expect(200, lines.map(line => ({ ...line, revenueGroupId: null, revenueGroupName: null })));
+  const response = await client.get(`${salesPath}&docType=BFD&gestiune=2`).set(...bearer).expect(200, lines.map(line => ({ ...line, revenueGroupId: null, revenueGroupName: null, businessValueKind: 'sale' })));
   assert.equal(response.headers['cache-control'], 'no-store');
   assert.ok(!response.text.includes('private-borg-token'));
   const me = await client.get('/api/me').set(...bearer).expect(200);
@@ -581,6 +581,64 @@ test('group restrictions cover both sales formats, filters, metadata, and role r
   await client.get(path).set(...bearer).expect(403);
   await client.get('/api/revenue-groups?targetEntity=agritehnica').set(...bearer).expect(403);
   assert.equal(calls, 3);
+});
+
+test('sales return authorized rows with optional access metadata and no aggregate totals', async () => {
+  const raw = [
+    { miscareId: 1, grupa: 'Utilaje', valoareNet: 999999 },
+    { miscareId: 2, grupa: 'Horsch', valoareNet: 100 },
+    { miscareId: 3, grupa: 'Horsch', tipDocument: 'AIMS', valoareNet: -20 },
+    { miscareId: 4, grupa: 'Discount', codProdus: '~111', valoareNet: -10 },
+    { miscareId: 5, grupa: 'Discount', codProdus: '~111', tipDocument: 'AIMS', valoareNet: 2 },
+    { miscareId: 6, grupa: 'Discount', codProdus: 'AVANS CLIENT', valoareNet: 1000 },
+    { miscareId: 7, grupa: 'Horsch', valoareNet: null },
+  ];
+  const { client } = setup({ config: { borg: borgConfig }, store: {
+    getUserAccess: async () => ({ ...access('reader', ['agritehnica']), permissions: ['sales:read'], salesGroups: ['piese'] }),
+  }, fetchBorg: async () => Response.json(raw) });
+  const path = `${salesPath.replace('babyhub', 'agritehnica')}&limit=7`;
+  const rows = await client.get(path).set(...bearer).expect(200);
+  assert.ok(Array.isArray(rows.body));
+  assert.deepEqual(rows.body.map((line: { miscareId: number }) => line.miscareId), [2, 3, 4, 5, 6, 7]);
+  assert.deepEqual(rows.body.map((line: { valoareNet: unknown }) => line.valoareNet), [100, -20, -10, 2, 1000, null]);
+  const response = await client.get(`${path}&responseFormat=grouped`).set(...bearer).expect(200);
+  assert.deepEqual(Object.keys(response.body).sort(), ['accessVersion', 'lines', 'possiblyTruncated']);
+  assert.deepEqual(response.body.lines, rows.body);
+  assert.equal(response.body.possiblyTruncated, true);
+  assert.ok(!response.text.includes('999999'));
+  await client.get(`${path}&revenueGroupId=utilaje`).set(...bearer).expect(403);
+  await client.get(`${path}&responseFormat=prepared`).set(...bearer).expect(400);
+});
+
+test('allocated discounts expose only the caller group share and discard BORG control metadata', async () => {
+  const raw = [{ miscareId: 77, tipLinie: 'discount', grupa: 'Discount', codProdus: 'NEW-DISCOUNT',
+    valoareNet: -100, valoareSalvata: -100, valoareTVA: -21, valoareTotal: -121, marja: -100, costTotal: 0,
+    alocareDiscount: { sursa: 'document', grupe: [
+      { grupa: 'Utilaje', valoareNet: -80 }, { grupa: 'Horsch', valoareNet: -20 },
+    ] } }];
+  const { client } = setup({ config: { borg: borgConfig }, store: {
+    getUserAccess: async () => ({ ...access('reader', ['agritehnica']), permissions: ['sales:read'], salesGroups: ['piese'] }),
+  }, fetchBorg: async address => {
+    assert.equal(new URL(address).searchParams.get('envelope'), 'true');
+    return Response.json({ lines: raw, meta: { truncated: false, control: { private: 999999 }, warnings: ['private warning'] } });
+  } });
+  const path = `${salesPath.replace('babyhub', 'agritehnica')}&revenueGroupId=piese&limit=1`;
+  const response = await client.get(`${path}&responseFormat=grouped`).set(...bearer).expect(200);
+  assert.deepEqual(Object.keys(response.body).sort(), ['accessVersion', 'lines', 'possiblyTruncated']);
+  assert.equal(response.body.possiblyTruncated, false);
+  assert.equal(response.body.lines.length, 1);
+  const [line] = response.body.lines;
+  assert.equal(line.revenueGroupId, 'piese');
+  assert.equal(line.businessValueKind, 'discount');
+  assert.equal(line.valoareNet, -20);
+  assert.equal(line.valoareSalvata, -20);
+  assert.equal(line.valoareTotal, -24.2);
+  assert.deepEqual(line.alocareDiscount, { sursa: 'document', grupe: [{ grupa: 'Horsch', valoareNet: -20 }] });
+  assert.ok(!response.text.includes('Utilaje'));
+  assert.ok(!response.text.includes('private'));
+  assert.ok(!response.text.includes('-100'));
+  const plain = await client.get(path).set(...bearer).expect(200);
+  assert.deepEqual(plain.body, response.body.lines);
 });
 
 test('group configuration and role grants require administrators and validate the complete payload', async () => {

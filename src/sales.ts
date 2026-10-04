@@ -13,7 +13,7 @@ export interface SalesQuery {
   gestiune?: number;
   revenueGroupId?: RevenueGroupId;
   responseFormat?: 'grouped';
-  docType?: 'BFD' | 'AIM';
+  docType?: 'BFD' | 'AIM' | 'AIMS';
   limit: number;
   includeTransfers: boolean;
 }
@@ -55,31 +55,51 @@ export function parseSalesQuery(query: Record<string, unknown>): SalesQuery {
   if (days < 1) throw new HttpError(400, 'from must be on or before to.');
   if (days > 30) throw new HttpError(400, 'Sales intervals may contain at most 30 days, including both from and to.');
   if (from.text.slice(0, 4) !== to.text.slice(0, 4)) throw new HttpError(400, 'Sales intervals must stay within one calendar year.');
-  if (docType !== undefined && docType !== 'BFD' && docType !== 'AIM') throw new HttpError(400, 'docType must be BFD or AIM.');
+  if (docType !== undefined && docType !== 'BFD' && docType !== 'AIM' && docType !== 'AIMS') throw new HttpError(400, 'docType must be BFD, AIM, or AIMS.');
   if (includeTransfers !== undefined && includeTransfers !== 'true' && includeTransfers !== 'false') {
     throw new HttpError(400, 'includeTransfers must be true or false.');
   }
   return {
     targetEntity, from: from.text, to: to.text, docType,
     revenueGroupId: query.revenueGroupId as RevenueGroupId | undefined,
-    responseFormat: query.responseFormat as 'grouped' | undefined,
+    responseFormat: query.responseFormat as SalesQuery['responseFormat'],
     gestiune: query.gestiune === undefined ? undefined : positiveInteger(query.gestiune, 'gestiune', Number.MAX_SAFE_INTEGER),
     limit: query.limit === undefined ? 5000 : positiveInteger(query.limit, 'limit', 50000),
     includeTransfers: includeTransfers === 'true',
   };
 }
 
-export function createSalesClient(config: AppConfig['borg'], fetchBorg: BorgFetch = fetch) {
-  return async (query: SalesQuery): Promise<Record<string, unknown>[]> => {
-    const lines = await requestBorg(config, fetchBorg, 'sales', {
+export interface SalesPage {
+  lines: Record<string, unknown>[];
+  possiblyTruncated: boolean;
+}
+
+export function createSalesPageClient(config: AppConfig['borg'], fetchBorg: BorgFetch = fetch) {
+  return async (query: SalesQuery): Promise<SalesPage> => {
+    const response = await requestBorg(config, fetchBorg, 'sales', {
       targetEntity: query.targetEntity, from: query.from, to: query.to,
       limit: String(query.limit), includeTransfers: String(query.includeTransfers),
       gestiune: query.gestiune?.toString(), docType: query.docType,
+      envelope: 'true',
     });
+    // Old BORG versions ignore envelope and still return an array.
+    const lines = Array.isArray(response) ? response : isRecord(response) ? response.lines : undefined;
     if (!Array.isArray(lines) || lines.length > query.limit || !lines.every(isRecord)) {
       throw new HttpError(502, 'Borg returned an invalid sales response.');
     }
-    // Preserve raw values (including returns, nulls, costs, and margins).
-    return lines;
+    let possiblyTruncated = lines.length >= query.limit;
+    if (!Array.isArray(response)) {
+      if (!isRecord(response) || !isRecord(response.meta) || typeof response.meta.truncated !== 'boolean') {
+        throw new HttpError(502, 'Borg returned invalid sales completeness metadata.');
+      }
+      possiblyTruncated = response.meta.truncated;
+    }
+    // Keep the authoritative money unchanged; only consume completeness metadata.
+    return { lines, possiblyTruncated };
   };
+}
+
+export function createSalesClient(config: AppConfig['borg'], fetchBorg: BorgFetch = fetch) {
+  const fetchPage = createSalesPageClient(config, fetchBorg);
+  return async (query: SalesQuery): Promise<Record<string, unknown>[]> => (await fetchPage(query)).lines;
 }
