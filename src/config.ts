@@ -34,6 +34,5 @@ export function readConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     // Endpoints such as /sales and /stock are appended to this base.
     borg = { baseUrl: url.origin + url.pathname.replace(/\/+$/, ''), authorization };
   }
-  return { tenantId, databaseUrl: env.DATABASE_URL, origins, port, trustProxyHops, borg,
-    ...(env.SALES_RECONCILIATION_FILE?.trim() ? { salesReconciliationFile: env.SALES_RECONCILIATION_FILE.trim() } : {}) };
+  return { tenantId, databaseUrl: env.DATABASE_URL, origins, port, trustProxyHops, borg };
 }

@@ -6,8 +6,6 @@ import type { RevenueConfiguration } from '../src/revenue.js';
 import { permissionsFor } from '../src/permissions.js';
 import { createApp } from '../src/app.js';
 import { readConfig } from '../src/config.js';
-import type { SalesReconciliation } from '../src/salesReconciliation.js';
-import { report as businessReport } from './reconciliationFixtures.js';
 import type { BorgFetch } from '../src/borg.js';
 import type { AppConfig, AuthenticatedUser, CreateRequestInput, GraphFetch, RequestPage, Role, Store, SupportRequest, UserAccess } from '../src/types.js';
 
@@ -25,7 +23,6 @@ interface SetupOptions {
   rateLimitMax?: number;
   role?: Role;
   targetEntities?: UserAccess['targetEntities'];
-  reconciliations?: SalesReconciliation[];
 }
 
 const storedRequest: SupportRequest = {
@@ -84,44 +81,10 @@ function setup(options: SetupOptions = {}) {
       ? { id: userId, displayName: 'Test User', mail: 'user@example.com' }
       : { value: [{ id: options.tenantId ?? tenantId }] });
   });
-  const app = createApp({ config: { ...config, ...options.config }, store, fetchGraph, fetchBorg: options.fetchBorg, rateLimitMax: options.rateLimitMax ?? 120, reconciliations: options.reconciliations });
+  const app = createApp({ config: { ...config, ...options.config }, store, fetchGraph, fetchBorg: options.fetchBorg, rateLimitMax: options.rateLimitMax ?? 120 });
   return { client: request(app), calls, graphCalls };
 }
 const bearer = ['Authorization', 'Bearer opaque-graph-token'] as const;
-
-test('reconciled September Piese uses business lines and preserves entity and group authorization', async () => {
-  const reconciliations = [businessReport()];
-  const fetchBorg: BorgFetch = async () => Response.json([
-    { miscareId: 1, documentId: 10, serie: 'BR', numar: 1, tipDocument: 'AIM', produs: 'Filtru', data: '2026-09-01', grupa: 'Filtre', cantitate: 1, valoareNet: 7530375.31 },
-    { miscareId: 2, data: '2026-09-01', grupa: 'Utilaje', valoareNet: 100 },
-  ]);
-  const path = '/api/borg/sales?targetEntity=agritehnica&from=2026-09-01&to=2026-09-30&limit=50000&responseFormat=grouped';
-  const { client } = setup({ role: 'admin', targetEntities: ['agritehnica'], fetchBorg, reconciliations,
-    config: { borg: { baseUrl: 'https://borg.example/api2/borg', authorization: 'private-token' } } });
-  const { body } = await client.get(path + '&revenueGroupId=piese').set(...bearer).expect(200);
-  assert.equal(body.lines.reduce((sum: number, line: Record<string, unknown>) => sum + Math.round(Number(line.valoareNet) * 100), 0) / 100, 5160147.07);
-  assert.equal(body.reconciliations[0].salesBeforeDiscounts, 5387882.07);
-  assert.equal(body.reconciliations[0].discounts, 227735);
-  assert.ok(body.lines.every((line: Record<string, unknown>) => line.revenueGroupId === 'piese'));
-  assert.equal(body.lines.filter((line: Record<string, unknown>) => line.businessReconciliationAdjustment).length, 2);
-  const catalog = await client.get('/api/revenue-groups?targetEntity=agritehnica').set(...bearer).expect(200);
-  assert.equal(catalog.body.accessVersion, body.accessVersion);
-  const narrower = await client.get(path + '&docType=AIM').set(...bearer).expect(200);
-  assert.ok(narrower.body.lines.every((line: Record<string, unknown>) => line.tipDocument === 'AIM' || line.revenueGroupId !== 'piese'));
-  const restricted = setup({ role: 'admin', targetEntities: ['agritehnica'], fetchBorg, reconciliations,
-    config: { borg: { baseUrl: 'https://borg.example/api2/borg', authorization: 'private-token' } },
-    store: { getUserAccess: async () => ({ ...access('admin', ['agritehnica']), salesGroups: ['utilaje'] }) } });
-  const hidden = await restricted.client.get(path).set(...bearer).expect(200);
-  assert.equal(hidden.body.reconciliations, undefined);
-  assert.deepEqual(hidden.body.lines.map((line: Record<string, unknown>) => line.revenueGroupId), ['utilaje']);
-  await restricted.client.get(path + '&revenueGroupId=piese').set(...bearer).expect(403);
-  await setup({ role: 'admin', reconciliations }).client.get(path).set(...bearer).expect(403);
-  const capped = setup({ role: 'admin', targetEntities: ['agritehnica'], fetchBorg: async () => Response.json([]), reconciliations,
-    config: { borg: { baseUrl: 'https://borg.example/api2/borg', authorization: 'private-token' } } });
-  const limited = await capped.client.get(path.replace('limit=50000', 'limit=1')).set(...bearer).expect(200);
-  assert.equal(limited.body.lines.length, 1);
-  assert.equal(limited.body.possiblyTruncated, true);
-});
 
 test('createUser saves the verified Microsoft profile with no body or an empty object', async () => {
   const { client, calls } = setup();

@@ -7,7 +7,6 @@ export interface AppConfig {
   origins: string[];
   port: number;
   trustProxyHops: number;
-  salesReconciliationFile?: string;
   borg?: {
     baseUrl: string;
     authorization: string;

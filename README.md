@@ -228,63 +228,6 @@ if (!response.ok) throw new Error(data.error);
 
 ### Borg sales
 
-#### Closed-month business reconciliation
-
-An optional private report file supplies the authoritative Agritehnica **Piese**
-lines for a closed month when Borg's operational sales do not match the business
-report. This replaces that month's Piese lines before authorization; other
-months and groups continue using Borg. A report line that also appears in another
-live group is removed there to avoid double counting. The report's Piese scope is
-authoritative, including any categories its author included.
-
-Generate the private file from the two business CSV exports:
-
-```bash
-mkdir -p data
-npm run sales:reconcile -- \
-  --sales '/path/to/vânzari 2026.csv' \
-  --discounts '/path/to/discounturi 2026.csv' \
-  --month 2026-09 --sales-marker 5387882.07 --discount-marker 227735 \
-  --output data/piese-2026-09.local
-```
-
-Set `SALES_RECONCILIATION_FILE=data/piese-2026-09.local` in the backend environment
-and restart. The file contains confidential report data, is ignored by Git and
-must remain on the backend. For deployment, provision it as a private file on
-the backend service and set the environment variable to its actual path. Never
-copy it into frontend assets. The import refuses to overwrite existing files;
-combine report objects into one private JSON array to reconcile multiple months.
-
-September's supplied CSVs contain 5,029 sales lines totaling **5,387,882.17 lei**
-and 155 discount lines totaling **−227,735.06 lei**. The business markers are
-**5,387,882.07 lei** and **227,735.00 lei**. Two separate, labelled net adjustments
-(−0.10 lei sales and +0.06 lei discounts) reconcile those differences, producing
-**5,160,147.07 lei** net. Differences above one leu are rejected for investigation.
-CSV values already reflect their line discounts; no second percentage discount is
-applied. `AIMS` sales and discount reversals keep their signed values.
-
-The dashboard shows report provenance and a separate discount KPI. All charts,
-tables and exports use the same reconciled lines. Discounts and rounding entries
-do not count as returned goods or sold quantities; rounding entries do not create
-documents. VAT is calculated from each report line's exported rate; the business
-markers specify net amounts, so their small reconciliation entries have no VAT.
-Matching Borg documents retain available warehouse, client, operator and agent
-identifiers. Unmatched report lines retain only the fields available in the CSV.
-
-Date subsets and document-type filters select report lines. A warehouse query or
-`includeTransfers=true` uses live Borg instead, because the sales CSV does not
-provide warehouse IDs or cover internal transfers. Disabling revenue grouping
-also disables reconciliation. Report changes require a backend restart and change
-the access version, invalidating frontend caches. The grouped sales response
-includes optional `reconciliations` metadata only for groups the caller may read.
-
-This is an explicit closed-month report source, not a repair to Borg's SQL query.
-The live September response was verified at **7,530,375.31 lei** for default Piese.
-It omits `AIMS`, includes non-sales entries from the `Discount` category (advances,
-rental and other charges), and disagrees with report prices and document scope.
-Direct SQL inspection was unavailable; future months still require upstream
-investigation or their own approved reports.
-
 The frontend sends its **Microsoft Graph access token** to this backend. The backend verifies the user's saved `sales:read` permission and explicit grant for the requested `targetEntity`, then uses the separate Borg credential for the upstream request. It never forwards the Microsoft token to Borg. An empty entity list denies all Borg data access, even for admins. The built-in `user` and `support` roles lack `sales:read`; create and assign a custom sales role when appropriate.
 
 ```ts

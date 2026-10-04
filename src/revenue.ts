@@ -78,9 +78,9 @@ export function visibleRevenueGroups(user: AuthenticatedUser, groups: RevenueGro
 }
 
 /** Binds cached sales and multi-request datasets to the current identity and policy. */
-export function salesAccessVersion(user: AuthenticatedUser, config: RevenueConfiguration, reportVersion?: string): string {
+export function salesAccessVersion(user: AuthenticatedUser, config: RevenueConfiguration): string {
   return createHash('sha256').update(JSON.stringify([
     user.tenantId, user.id, user.role, [...user.permissions].sort(), [...user.targetEntities].sort(),
-    user.salesGroups === null ? null : [...user.salesGroups].sort(), config.targetEntity, config.revision, reportVersion,
+    user.salesGroups === null ? null : [...user.salesGroups].sort(), config.targetEntity, config.revision,
   ])).digest('hex');
 }
