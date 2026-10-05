@@ -363,18 +363,35 @@ test('only verified admins can call Borg sales; role revocation takes effect on 
   assert.equal(count, 1);
 });
 
-test('Borg sales returns the plain array and keeps frontend and upstream credentials separate', async () => {
-  const lines = [{ documentId: 2157, cantitate: -1, valoareTotal: -1332, facturaData: null }];
+test('Borg sales returns Borg\'s response unchanged and keeps frontend and upstream credentials separate', async () => {
+  const body = {
+    meta: { targetEntity: 'babyhub', from: '2026-09-01', to: '2026-09-30', account: '401.G', docType: 'FF', limit: 5000, entries: 1, truncated: false },
+    entries: [{ id: 2205020, dataInregistrare: '2026-09-01T00:00:00.000Z', tipDocument: 'FF', contDebit: '371.G.06', contCredit: '401.G', suma: 9939.46, agentDebit: null }],
+  };
   const { client } = setup({ role: 'admin', targetEntities: ['babyhub'], config: { borg: borgConfig }, fetchBorg: async (url, init) => {
     assert.equal(new Headers(init.headers).get('Authorization'), borgConfig.authorization);
     assert.ok(!url.includes('opaque-graph-token'));
-    return Response.json(lines);
+    const params = new URL(url).searchParams;
+    assert.equal(params.get('docType'), 'FF');
+    assert.equal(params.get('account'), '401.G');
+    assert.equal(params.get('envelope'), 'true');
+    return Response.json(body);
   } });
-  const response = await client.get(`${salesPath}&docType=BFD&gestiune=2`).set(...bearer).expect(200, lines.map(line => ({ ...line, revenueGroupId: null, revenueGroupName: null, businessValueKind: 'sale' })));
+  const response = await client.get(`${salesPath}&docType=FF&account=401.G`).set(...bearer).expect(200, body);
   assert.equal(response.headers['cache-control'], 'no-store');
   assert.ok(!response.text.includes('private-borg-token'));
   const me = await client.get('/api/me').set(...bearer).expect(200);
   assert.ok(me.body.user.permissions.includes('sales:read'));
+});
+
+test('Borg sales forwards a plain array or an unexpected shape without changing it', async () => {
+  let body: unknown = [{ id: 1, suma: 5 }];
+  const { client } = setup({ role: 'admin', targetEntities: ['babyhub'], config: { borg: borgConfig }, fetchBorg: async () => Response.json(body) });
+  await client.get(salesPath).set(...bearer).expect(200, body);
+  body = { lines: [{ miscareId: 1 }], whatever: { nested: true } };
+  await client.get(salesPath).set(...bearer).expect(200, body);
+  body = null;
+  await client.get(salesPath).set(...bearer).expect(502);
 });
 
 test('invalid sales queries are rejected before calling Borg', async () => {
@@ -385,6 +402,8 @@ test('invalid sales queries are rejected before calling Borg', async () => {
     '/api/borg/sales?targetEntity=babyhub&from=2026-12-31&to=2027-01-01',
     `${salesPath}&targetEntity=green`, `${salesPath}&limit=50001`, `${salesPath}&from=2026-09-02`,
     `${salesPath}&includeTransfers=1`, `${salesPath}&url=https://attacker.example`,
+    `${salesPath}&gestiune=2`, `${salesPath}&includeTransfers=false`, `${salesPath}&revenueGroupId=piese`,
+    `${salesPath}&responseFormat=grouped`, `${salesPath}&docType=`, `${salesPath}&account=401%20G`,
   ]) await client.get(path).set(...bearer).expect(400);
 });
 
@@ -545,100 +564,42 @@ test('custom read-all permission also permits reading own requests', async () =>
   await client.post('/api/requests').set(...bearer).send({ title: 'Help', description: 'Help' }).expect(403);
 });
 
-test('group restrictions cover both sales formats, filters, metadata, and role revocation', async () => {
+test('group-scoped roles cannot read Borg sales and Borg is never called for them', async () => {
   let groups: UserAccess['salesGroups'] = ['utilaje'];
   let calls = 0;
-  const raw = [
-    { miscareId: 1, grupa: 'Utilaje', valoareNet: 100 },
-    { miscareId: 2, grupa: 'Manipulare', valoareNet: 20, revenueGroupId: 'utilaje' },
-    { miscareId: 3, grupa: 'Filtre', valoareNet: -10 },
-  ];
+  const body = { meta: { truncated: false }, entries: [{ id: 1, suma: 100 }] };
   const { client } = setup({ config: { borg: borgConfig }, store: {
-    getUserAccess: async () => ({ ...access('reader', ['agritehnica', 'green']), permissions: ['sales:read'], salesGroups: groups }),
-  }, fetchBorg: async () => { calls++; return Response.json(raw); } });
+    getUserAccess: async () => ({ ...access('reader', ['agritehnica']), permissions: ['sales:read'], salesGroups: groups }),
+  }, fetchBorg: async () => { calls++; return Response.json(body); } });
   const path = salesPath.replace('babyhub', 'agritehnica');
-  const legacy = await client.get(path).set(...bearer).expect(200);
-  assert.deepEqual(legacy.body.map((line: { miscareId: number }) => line.miscareId), [1]);
-  const grouped = await client.get(`${path}&responseFormat=grouped&limit=3`).set(...bearer).expect(200);
-  assert.deepEqual(grouped.body.lines, legacy.body);
-  assert.equal(grouped.body.possiblyTruncated, true);
-  const meta = await client.get('/api/revenue-groups?targetEntity=agritehnica').set(...bearer).expect(200);
-  assert.deepEqual(meta.body.groups.map((group: { id: string }) => group.id), ['utilaje']);
-  assert.equal(meta.body.accessVersion, grouped.body.accessVersion);
-  await client.get(`${path}&revenueGroupId=piese`).set(...bearer).expect(403);
-  await client.get(`${path}&revenueGroupId=other&gestiune=2`).set(...bearer).expect(403);
-  await client.get(`${path}&revenueGroupId=unknown`).set(...bearer).expect(400);
-  await client.get(`${path}&responseFormat=raw`).set(...bearer).expect(400);
-  await client.get(`${path}&revenueGroupId=utilaje&revenueGroupId=piese`).set(...bearer).expect(400);
-  await client.get(path.replace('agritehnica', 'babyhub')).set(...bearer).expect(403);
-  await client.get(path.replace('agritehnica', 'green')).set(...bearer).expect(403);
-  assert.equal(calls, 2);
+  for (const scoped of [['utilaje'], ['piese'], []] as UserAccess['salesGroups'][]) {
+    groups = scoped;
+    await client.get(path).set(...bearer).expect(403);
+  }
+  assert.equal(calls, 0);
+  groups = null;
+  const response = await client.get(path).set(...bearer).expect(200, body);
+  assert.deepEqual(response.body, body);
+  groups = ['utilaje'];
+  await client.get(path).set(...bearer).expect(403);
+  assert.equal(calls, 1);
+});
+
+test('revenue group metadata is scoped to the caller and changes its version with the role', async () => {
+  let groups: UserAccess['salesGroups'] = ['utilaje'];
+  const { client } = setup({ config: { borg: borgConfig }, store: {
+    getUserAccess: async () => ({ ...access('reader', ['agritehnica']), permissions: ['sales:read'], salesGroups: groups }),
+  } });
+  const path = '/api/revenue-groups?targetEntity=agritehnica';
+  const scoped = await client.get(path).set(...bearer).expect(200);
+  assert.deepEqual(scoped.body.groups.map((group: { id: string }) => group.id), ['utilaje']);
   groups = ['manopera', 'piese'];
-  const service = await client.get(`${path}&responseFormat=grouped`).set(...bearer).expect(200);
-  assert.deepEqual(service.body.lines.map((line: { miscareId: number }) => line.miscareId), [2, 3]);
-  assert.notEqual(service.body.accessVersion, grouped.body.accessVersion);
+  const service = await client.get(path).set(...bearer).expect(200);
+  assert.deepEqual(service.body.groups.map((group: { id: string }) => group.id).sort(), ['manopera', 'piese']);
+  assert.notEqual(service.body.accessVersion, scoped.body.accessVersion);
+  await client.get(path.replace('agritehnica', 'green')).set(...bearer).expect(403);
   groups = [];
   await client.get(path).set(...bearer).expect(403);
-  await client.get('/api/revenue-groups?targetEntity=agritehnica').set(...bearer).expect(403);
-  assert.equal(calls, 3);
-});
-
-test('sales return authorized rows with optional access metadata and no aggregate totals', async () => {
-  const raw = [
-    { miscareId: 1, grupa: 'Utilaje', valoareNet: 999999 },
-    { miscareId: 2, grupa: 'Horsch', valoareNet: 100 },
-    { miscareId: 3, grupa: 'Horsch', tipDocument: 'AIMS', valoareNet: -20 },
-    { miscareId: 4, grupa: 'Discount', codProdus: '~111', valoareNet: -10 },
-    { miscareId: 5, grupa: 'Discount', codProdus: '~111', tipDocument: 'AIMS', valoareNet: 2 },
-    { miscareId: 6, grupa: 'Discount', codProdus: 'AVANS CLIENT', valoareNet: 1000 },
-    { miscareId: 7, grupa: 'Horsch', valoareNet: null },
-  ];
-  const { client } = setup({ config: { borg: borgConfig }, store: {
-    getUserAccess: async () => ({ ...access('reader', ['agritehnica']), permissions: ['sales:read'], salesGroups: ['piese'] }),
-  }, fetchBorg: async () => Response.json(raw) });
-  const path = `${salesPath.replace('babyhub', 'agritehnica')}&limit=7`;
-  const rows = await client.get(path).set(...bearer).expect(200);
-  assert.ok(Array.isArray(rows.body));
-  assert.deepEqual(rows.body.map((line: { miscareId: number }) => line.miscareId), [2, 3, 4, 5, 6, 7]);
-  assert.deepEqual(rows.body.map((line: { valoareNet: unknown }) => line.valoareNet), [100, -20, -10, 2, 1000, null]);
-  const response = await client.get(`${path}&responseFormat=grouped`).set(...bearer).expect(200);
-  assert.deepEqual(Object.keys(response.body).sort(), ['accessVersion', 'lines', 'possiblyTruncated']);
-  assert.deepEqual(response.body.lines, rows.body);
-  assert.equal(response.body.possiblyTruncated, true);
-  assert.ok(!response.text.includes('999999'));
-  await client.get(`${path}&revenueGroupId=utilaje`).set(...bearer).expect(403);
-  await client.get(`${path}&responseFormat=prepared`).set(...bearer).expect(400);
-});
-
-test('allocated discounts expose only the caller group share and discard BORG control metadata', async () => {
-  const raw = [{ miscareId: 77, tipLinie: 'discount', grupa: 'Discount', codProdus: 'NEW-DISCOUNT',
-    valoareNet: -100, valoareSalvata: -100, valoareTVA: -21, valoareTotal: -121, marja: -100, costTotal: 0,
-    alocareDiscount: { sursa: 'document', grupe: [
-      { grupa: 'Utilaje', valoareNet: -80 }, { grupa: 'Horsch', valoareNet: -20 },
-    ] } }];
-  const { client } = setup({ config: { borg: borgConfig }, store: {
-    getUserAccess: async () => ({ ...access('reader', ['agritehnica']), permissions: ['sales:read'], salesGroups: ['piese'] }),
-  }, fetchBorg: async address => {
-    assert.equal(new URL(address).searchParams.get('envelope'), 'true');
-    return Response.json({ lines: raw, meta: { truncated: false, control: { private: 999999 }, warnings: ['private warning'] } });
-  } });
-  const path = `${salesPath.replace('babyhub', 'agritehnica')}&revenueGroupId=piese&limit=1`;
-  const response = await client.get(`${path}&responseFormat=grouped`).set(...bearer).expect(200);
-  assert.deepEqual(Object.keys(response.body).sort(), ['accessVersion', 'lines', 'possiblyTruncated']);
-  assert.equal(response.body.possiblyTruncated, false);
-  assert.equal(response.body.lines.length, 1);
-  const [line] = response.body.lines;
-  assert.equal(line.revenueGroupId, 'piese');
-  assert.equal(line.businessValueKind, 'discount');
-  assert.equal(line.valoareNet, -20);
-  assert.equal(line.valoareSalvata, -20);
-  assert.equal(line.valoareTotal, -24.2);
-  assert.deepEqual(line.alocareDiscount, { sursa: 'document', grupe: [{ grupa: 'Horsch', valoareNet: -20 }] });
-  assert.ok(!response.text.includes('Utilaje'));
-  assert.ok(!response.text.includes('private'));
-  assert.ok(!response.text.includes('-100'));
-  const plain = await client.get(path).set(...bearer).expect(200);
-  assert.deepEqual(plain.body, response.body.lines);
 });
 
 test('group configuration and role grants require administrators and validate the complete payload', async () => {

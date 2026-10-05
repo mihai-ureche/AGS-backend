@@ -10,9 +10,8 @@ import type { AppConfig, GraphFetch, Store, TargetEntity, UserUpdate } from './t
 import { isRecord, isRequestPriority, isRequestStatus, isTargetEntity } from './validation.js';
 import { assignablePermissions, isRoleName, permissionsFor, requirePermission } from './permissions.js';
 import type { BorgFetch } from './borg.js';
-import { createSalesPageClient, parseSalesQuery } from './sales.js';
-import { prepareSales } from './salesReporting.js';
-import { classifySales, parseRevenueUpdate, parseSalesGroups, salesAccessVersion, visibleRevenueGroups } from './revenue.js';
+import { createSalesClient, parseSalesQuery } from './sales.js';
+import { parseRevenueUpdate, parseSalesGroups, salesAccessVersion, visibleRevenueGroups } from './revenue.js';
 import { createStockClient, parseStockQuery } from './stock.js';
 
 interface AppOptions {
@@ -51,7 +50,7 @@ function requireEntity(req: Request, entity: TargetEntity) {
 
 export function createApp({ config, store, fetchGraph, fetchBorg, rateLimitMax = 120 }: AppOptions) {
   const app = express();
-  const fetchSales = createSalesPageClient(config.borg, fetchBorg);
+  const fetchSales = createSalesClient(config.borg, fetchBorg);
   const fetchStock = createStockClient(config.borg, fetchBorg);
   app.disable('x-powered-by');
   app.set('trust proxy', config.trustProxyHops);
@@ -105,22 +104,12 @@ export function createApp({ config, store, fetchGraph, fetchBorg, rateLimitMax =
   api.get('/borg/sales', requirePermission('sales:read'), async (req, res) => {
     const query = parseSalesQuery(req.query);
     requireEntity(req, query.targetEntity);
-    const user = authenticatedUser(req);
-    const grouping = await store.getRevenueConfiguration(query.targetEntity);
-    const groups = grouping.enabled ? visibleRevenueGroups(user, grouping.groups) : [];
-    if ((user.salesGroups !== null && !groups.length)
-      || (query.revenueGroupId && !groups.some(group => group.id === query.revenueGroupId))) {
-      throw new HttpError(403, 'Your role does not have access to the requested revenue groups.');
+    // Borg's entries carry no product category, so they cannot be split by revenue
+    // group. Fail closed for group-scoped roles instead of showing them everything.
+    if (authenticatedUser(req).salesGroups !== null) {
+      throw new HttpError(403, 'Borg sales are not split into revenue groups, so your group-scoped role cannot read them.');
     }
-    const { lines: raw, possiblyTruncated } = await fetchSales(query);
-    const allowed = new Set(groups.map(group => group.id));
-    const visible = classifySales(raw, grouping).filter(line =>
-      (user.salesGroups === null || (line.revenueGroupId !== null && allowed.has(line.revenueGroupId)))
-      && (!query.revenueGroupId || line.revenueGroupId === query.revenueGroupId));
-    const lines = prepareSales(visible, query.targetEntity);
-    res.json(query.responseFormat === 'grouped'
-      ? { lines, possiblyTruncated, accessVersion: salesAccessVersion(user, grouping) }
-      : lines);
+    res.json(await fetchSales(query));
   });
   api.get('/revenue-groups', requirePermission('sales:read'), async (req, res) => {
     if (Object.keys(req.query).some(key => key !== 'targetEntity') || !isTargetEntity(req.query.targetEntity)) {
