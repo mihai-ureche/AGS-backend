@@ -1,10 +1,21 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readConfig } from '../src/config.js';
-import { createSalesClient, createSalesPageClient, parseSalesQuery } from '../src/sales.js';
+import { createSalesClient, parseSalesQuery } from '../src/sales.js';
 
 const base = { targetEntity: 'babyhub', from: '2026-09-01', to: '2026-09-30' };
 const borg = { baseUrl: 'https://borg.example/api2/borg', authorization: 'Bearer private-borg-token' };
+
+// Shaped like a live Borg ledger entry; every value is invented.
+const entry = {
+  id: 1, dataInregistrare: '2026-09-01T00:00:00.000Z', tipDocument: 'FF', numarDocument: '10',
+  gestiuneId: 1, contDebit: '371.G.06', contCredit: '401.G', suma: 120.5, sumaValuta: 120.5, curs: 1,
+  tertCredit: 'EXAMPLE SRL', agentDebit: null, centruCostId: null,
+};
+const envelope = {
+  meta: { targetEntity: 'agritehnica', from: base.from, to: base.to, account: null, docType: null, limit: 5000, entries: 1, truncated: false },
+  entries: [entry],
+};
 
 test('sales validates inclusive 30-day ranges, leap days, and cross-month intervals', () => {
   for (const [from, to] of [
@@ -16,7 +27,6 @@ test('sales validates inclusive 30-day ranges, leap days, and cross-month interv
     assert.equal(query.from, from);
     assert.equal(query.to, to);
     assert.equal(query.limit, 5000);
-    assert.equal(query.includeTransfers, false);
   }
   for (const [from, to] of [
     ['2026-08-01', '2026-08-31'], ['2026-09-01', '2026-10-01'],
@@ -27,78 +37,76 @@ test('sales validates inclusive 30-day ranges, leap days, and cross-month interv
   ]) assert.throws(() => parseSalesQuery({ ...base, from, to }), { status: 400 });
 });
 
-test('sales rejects missing, repeated, unknown, and invalid filters', () => {
+test('sales accepts any Borg document type and account code', () => {
+  for (const docType of ['FF', 'ff', 'EC', 'FFA', 'AIMR', 'DP', 'BCD', 'FFBF', 'OPM', 'AIMT', 'BFD', 'AIM', 'AIMS']) {
+    assert.equal(parseSalesQuery({ ...base, docType }).docType, docType);
+  }
+  for (const account of ['401', '401.G', '371.G.06', '5121.000', '4111.G', '707']) {
+    assert.equal(parseSalesQuery({ ...base, account }).account, account);
+  }
+  const query = parseSalesQuery(base);
+  assert.equal(query.docType, undefined);
+  assert.equal(query.account, undefined);
+});
+
+test('sales rejects missing, repeated, unknown, removed, and invalid filters', () => {
   for (const patch of [
     { targetEntity: undefined }, { targetEntity: 'unknown' }, { targetEntity: ['babyhub', 'green'] },
     { from: undefined }, { to: undefined }, { from: ['2026-09-01'] }, { to: {} },
-    { docType: 'FC' }, { docType: ['BFD', 'AIM'] }, { docType: '' },
-    { gestiune: '0' }, { gestiune: '-1' }, { gestiune: '1.5' }, { gestiune: '1e2' }, { gestiune: '9007199254740992' },
+    { docType: '' }, { docType: ['FF', 'EC'] }, { docType: 'F F' }, { docType: 'FF;' }, { docType: 'ABCDEFGHIJK' },
+    { account: '' }, { account: ['401', '371'] }, { account: '401 G' }, { account: '401!' }, { account: 'x'.repeat(33) },
     { limit: '0' }, { limit: '50001' }, { limit: ['5', '10'] }, { limit: '1.5' },
-    { includeTransfers: '1' }, { includeTransfers: true }, { includeTransfers: ['true', 'false'] },
-    { responseFormat: 'prepared' }, { responseFormat: ['grouped'] }, { responseFormat: ['grouped', 'prepared'] },
+    // Borg no longer filters by these, so accepting them would silently return unfiltered data.
+    { gestiune: '2' }, { includeTransfers: 'false' }, { revenueGroupId: 'piese' }, { responseFormat: 'grouped' },
     { url: 'https://other.example' }, { authorization: 'attacker-token' },
   ]) assert.throws(() => parseSalesQuery({ ...base, ...patch }), { status: 400 });
 });
 
-test('sales forwards AIMS without forwarding backend response options', async () => {
-  const query = parseSalesQuery({ ...base, targetEntity: 'agritehnica', docType: 'AIMS', responseFormat: 'grouped' });
-  const sales = createSalesClient(borg, async address => {
-    const params = new URL(address).searchParams;
-    assert.equal(params.get('docType'), 'AIMS');
-    assert.equal(params.has('responseFormat'), false);
-    assert.equal(params.get('envelope'), 'true');
-    return Response.json([]);
-  });
-  assert.deepEqual(await sales(query), []);
-});
-
 test('sales forwards every validated filter and only the server credential', async () => {
-  const lines = [{ documentId: 2157, miscareId: 6936, cantitate: -1, valoareNet: -1100.83, marja: -308.27, facturaSerie: null }];
   for (const targetEntity of ['babyhub', 'agritehnica', 'green']) {
     const sales = createSalesClient(borg, async (address, init) => {
       const url = new URL(address);
       assert.equal(url.origin, 'https://borg.example');
       assert.equal(url.pathname, '/api2/borg/sales');
       assert.deepEqual(Object.fromEntries(url.searchParams), {
-        targetEntity, from: base.from, to: base.to, gestiune: '2', docType: 'AIM', limit: '50000', includeTransfers: 'true', envelope: 'true',
+        targetEntity, from: base.from, to: base.to, docType: 'FF', account: '401.G', limit: '50000', envelope: 'true',
       });
       assert.equal(init.method, 'GET');
       assert.equal(init.redirect, 'error');
       assert.ok(init.signal instanceof AbortSignal);
       assert.equal(new Headers(init.headers).get('Authorization'), borg.authorization);
-      return Response.json(lines);
+      return Response.json(envelope);
     });
-    assert.deepEqual(await sales(parseSalesQuery({ ...base, targetEntity, gestiune: '2', docType: 'AIM', limit: '50000', includeTransfers: 'true' })), lines);
+    assert.deepEqual(await sales(parseSalesQuery({ ...base, targetEntity, docType: 'FF', account: '401.G', limit: '50000' })), envelope);
   }
 });
 
-test('sales consumes exact BORG truncation metadata and keeps the row-array client compatible', async () => {
-  const lines = [{ miscareId: 1, tipLinie: 'produs', valoareNet: 90 }];
-  const query = { ...parseSalesQuery(base), limit: 1 };
-  for (const truncated of [false, true]) {
-    const fetchBorg = async () => Response.json({
-      meta: { truncated, control: { documentsChecked: 99 }, warnings: ['internal report detail'] }, lines,
-    });
-    assert.deepEqual(await createSalesPageClient(borg, fetchBorg)(query), { lines, possiblyTruncated: truncated });
-    assert.deepEqual(await createSalesClient(borg, fetchBorg)(query), lines);
-  }
-  assert.deepEqual(await createSalesPageClient(borg, async () => Response.json(lines))(query), { lines, possiblyTruncated: true });
-  for (const meta of [undefined, null, {}, { truncated: 'false' }]) {
-    await assert.rejects(createSalesPageClient(borg, async () => Response.json({ meta, lines }))(query), { status: 502 });
+test('sales returns Borg JSON unchanged whatever its shape', async () => {
+  for (const body of [
+    envelope,
+    { ...envelope, meta: { ...envelope.meta, truncated: true, warnings: ['kept'] }, extra: { nested: [1, 2] } },
+    { meta: { truncated: false }, entries: [] },
+    [entry], [],
+    // Borg changed its format once already, so unknown shapes must not be rejected.
+    { lines: [entry], meta: {} }, { something: 'new' }, {},
+  ]) {
+    const sales = createSalesClient(borg, async () => Response.json(body));
+    assert.deepEqual(await sales(parseSalesQuery(base)), body);
   }
 });
 
 test('sales supports raw authorization values, defaults, and empty results', async () => {
+  const empty = { meta: { ...envelope.meta, entries: 0 }, entries: [] };
   const sales = createSalesClient({ ...borg, authorization: 'raw-borg-token' }, async (address, init) => {
     const url = new URL(address);
     assert.equal(url.searchParams.get('limit'), '5000');
-    assert.equal(url.searchParams.get('includeTransfers'), 'false');
-    assert.equal(url.searchParams.has('gestiune'), false);
+    assert.equal(url.searchParams.get('envelope'), 'true');
     assert.equal(url.searchParams.has('docType'), false);
+    assert.equal(url.searchParams.has('account'), false);
     assert.equal(new Headers(init.headers).get('Authorization'), 'raw-borg-token');
-    return Response.json([]);
+    return Response.json(empty);
   });
-  assert.deepEqual(await sales(parseSalesQuery(base)), []);
+  assert.deepEqual(await sales(parseSalesQuery(base)), empty);
 });
 
 test('sales sanitizes upstream errors, redirects, invalid JSON, and timeouts', async () => {
@@ -112,10 +120,9 @@ test('sales sanitizes upstream errors, redirects, invalid JSON, and timeouts', a
       return true;
     });
   }
-  for (const response of [Response.json({ lines: [] }), Response.json([null]), Response.json([1]), new Response('<html>private</html>')]) {
+  for (const response of [Response.json(null), Response.json(1), Response.json('private'), new Response('<html>private</html>')]) {
     await assert.rejects(createSalesClient(borg, async () => response)(query), { status: 502 });
   }
-  await assert.rejects(createSalesClient(borg, async () => Response.json([{}, {}]))({ ...query, limit: 1 }), { status: 502 });
   await assert.rejects(createSalesClient(borg, async () => { throw new TypeError('private DNS error'); })(query), { status: 502 });
   await assert.rejects(createSalesClient(borg, async () => { throw new DOMException('private timeout', 'TimeoutError'); })(query), { status: 504 });
   await assert.rejects(createSalesClient(undefined, async () => { assert.fail('Unconfigured API called Borg'); })(query), { status: 503 });

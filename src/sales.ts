@@ -1,5 +1,3 @@
-import { isRevenueGroupId } from './revenue.js';
-import type { RevenueGroupId } from './revenue.js';
 import { requestBorg } from './borg.js';
 import type { BorgFetch } from './borg.js';
 import { HttpError } from './errors.js';
@@ -10,12 +8,11 @@ export interface SalesQuery {
   targetEntity: TargetEntity;
   from: string;
   to: string;
-  gestiune?: number;
-  revenueGroupId?: RevenueGroupId;
-  responseFormat?: 'grouped';
-  docType?: 'BFD' | 'AIM' | 'AIMS';
+  /** Borg document type (`tipDocument`), for example FF or EC. */
+  docType?: string;
+  /** Account code or prefix, matched by Borg against the debit and credit accounts. */
+  account?: string;
   limit: number;
-  includeTransfers: boolean;
 }
 
 function date(value: unknown, field: string): { text: string; timestamp: number } {
@@ -40,66 +37,44 @@ function positiveInteger(value: unknown, field: string, max: number): number {
   return number;
 }
 
+function code(value: unknown, pattern: RegExp, message: string): string | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== 'string' || !pattern.test(value)) throw new HttpError(400, message);
+  return value;
+}
+
 export function parseSalesQuery(query: Record<string, unknown>): SalesQuery {
-  const allowed = ['targetEntity', 'from', 'to', 'gestiune', 'docType', 'limit', 'includeTransfers', 'revenueGroupId', 'responseFormat'];
+  const allowed = ['targetEntity', 'from', 'to', 'docType', 'account', 'limit'];
   if (Object.keys(query).some(key => !allowed.includes(key))) throw new HttpError(400, 'Unsupported sales query parameter.');
-  const { targetEntity, docType, includeTransfers } = query;
+  const { targetEntity } = query;
   if (!isTargetEntity(targetEntity)) {
     throw new HttpError(400, 'targetEntity must be agritehnica, green, or babyhub.');
   }
-  if (query.revenueGroupId !== undefined && !isRevenueGroupId(query.revenueGroupId)) throw new HttpError(400, 'Unknown revenue group.');
-  if (query.responseFormat !== undefined && query.responseFormat !== 'grouped') throw new HttpError(400, 'Unsupported response format.');
   const from = date(query.from, 'from');
   const to = date(query.to, 'to');
   const days = (to.timestamp - from.timestamp) / 86_400_000 + 1;
   if (days < 1) throw new HttpError(400, 'from must be on or before to.');
   if (days > 30) throw new HttpError(400, 'Sales intervals may contain at most 30 days, including both from and to.');
   if (from.text.slice(0, 4) !== to.text.slice(0, 4)) throw new HttpError(400, 'Sales intervals must stay within one calendar year.');
-  if (docType !== undefined && docType !== 'BFD' && docType !== 'AIM' && docType !== 'AIMS') throw new HttpError(400, 'docType must be BFD, AIM, or AIMS.');
-  if (includeTransfers !== undefined && includeTransfers !== 'true' && includeTransfers !== 'false') {
-    throw new HttpError(400, 'includeTransfers must be true or false.');
-  }
   return {
-    targetEntity, from: from.text, to: to.text, docType,
-    revenueGroupId: query.revenueGroupId as RevenueGroupId | undefined,
-    responseFormat: query.responseFormat as SalesQuery['responseFormat'],
-    gestiune: query.gestiune === undefined ? undefined : positiveInteger(query.gestiune, 'gestiune', Number.MAX_SAFE_INTEGER),
+    targetEntity, from: from.text, to: to.text,
+    docType: code(query.docType, /^[A-Za-z0-9]{1,10}$/, 'docType must be 1–10 letters or digits.'),
+    account: code(query.account, /^[A-Za-z0-9._-]{1,32}$/, 'account must be 1–32 letters, digits, dots, underscores, or hyphens.'),
     limit: query.limit === undefined ? 5000 : positiveInteger(query.limit, 'limit', 50000),
-    includeTransfers: includeTransfers === 'true',
-  };
-}
-
-export interface SalesPage {
-  lines: Record<string, unknown>[];
-  possiblyTruncated: boolean;
-}
-
-export function createSalesPageClient(config: AppConfig['borg'], fetchBorg: BorgFetch = fetch) {
-  return async (query: SalesQuery): Promise<SalesPage> => {
-    const response = await requestBorg(config, fetchBorg, 'sales', {
-      targetEntity: query.targetEntity, from: query.from, to: query.to,
-      limit: String(query.limit), includeTransfers: String(query.includeTransfers),
-      gestiune: query.gestiune?.toString(), docType: query.docType,
-      envelope: 'true',
-    });
-    // Old BORG versions ignore envelope and still return an array.
-    const lines = Array.isArray(response) ? response : isRecord(response) ? response.lines : undefined;
-    if (!Array.isArray(lines) || lines.length > query.limit || !lines.every(isRecord)) {
-      throw new HttpError(502, 'Borg returned an invalid sales response.');
-    }
-    let possiblyTruncated = lines.length >= query.limit;
-    if (!Array.isArray(response)) {
-      if (!isRecord(response) || !isRecord(response.meta) || typeof response.meta.truncated !== 'boolean') {
-        throw new HttpError(502, 'Borg returned invalid sales completeness metadata.');
-      }
-      possiblyTruncated = response.meta.truncated;
-    }
-    // Keep the authoritative money unchanged; only consume completeness metadata.
-    return { lines, possiblyTruncated };
   };
 }
 
 export function createSalesClient(config: AppConfig['borg'], fetchBorg: BorgFetch = fetch) {
-  const fetchPage = createSalesPageClient(config, fetchBorg);
-  return async (query: SalesQuery): Promise<Record<string, unknown>[]> => (await fetchPage(query)).lines;
-}
+  return async (query: SalesQuery): Promise<unknown> => {
+    // The envelope makes Borg report completeness in `meta.truncated`.
+    const response = await requestBorg(config, fetchBorg, 'sales', {
+      targetEntity: query.targetEntity, from: query.from, to: query.to,
+      limit: String(query.limit), docType: query.docType, account: query.account,
+      envelope: 'true',
+    });
+    // Borg owns this format and has changed it before: forward whatever JSON it
+    // sends, rejecting only payloads that are neither an object nor an array.
+    if (!isRecord(response) && !Array.isArray(response)) throw new HttpError(502, 'Borg returned an invalid sales response.');
+    return response;
+  };
+ }

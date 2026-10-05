@@ -89,7 +89,7 @@ Every `/api/*` request requires `Authorization: Bearer YOUR_GRAPH_ACCESS_TOKEN`.
 | GET | `/api/requests` | List your requests; staff see all requests in the tenant |
 | GET | `/api/requests/:id` | Retrieve your request; staff can retrieve any in the tenant |
 | PATCH | `/api/requests/:id` | Staff only: update status with `{ "status": "in_progress" }` |
-| GET | `/api/borg/sales` | Requires `sales:read` and an explicit grant for `targetEntity`; returns the plain product-line array |
+| GET | `/api/borg/sales` | Requires `sales:read`, an explicit grant for `targetEntity`, and a role with all sales groups; returns Borg's JSON unchanged (`{ meta, entries }`) |
 | GET | `/api/borg/stock` | Requires `stock:read` and an explicit grant for `targetEntity`; returns Borg's stock JSON unchanged |
 
 Create requires `title` (1–200 characters) and `description` (1–10,000 characters). Optional `priority` is `low`, `normal` (default), or `high`. New requests start as `open`. Unknown body fields are rejected, including attempts to set an owner or staff role.
@@ -232,34 +232,36 @@ The frontend sends its **Microsoft Graph access token** to this backend. The bac
 
 ```ts
 const query = new URLSearchParams({
-  targetEntity: 'babyhub',
+  targetEntity: 'agritehnica',
   from: '2026-09-01',
   to: '2026-09-30',
-  docType: 'BFD',
-  gestiune: '2',
+  docType: 'FF',
+  account: '401.G',
   limit: '5000',
-  includeTransfers: 'false',
 });
 const response = await fetch(`${API_URL}/api/borg/sales?${query}`, {
   headers: { Authorization: `Bearer ${result.accessToken}` },
 });
 const data = await response.json();
 if (!response.ok) throw new Error(data.error);
-const lines = data; // Plain array, including [] when no sales match.
+const { meta, entries } = data; // Exactly what Borg returned.
 ```
+
+Borg's `/sales` endpoint now returns **accounting ledger entries** (`contDebit`, `contCredit`, `suma`, `tipDocument`, `gestiuneId`, third parties and so on), not product sales lines. The backend requests Borg's envelope and returns Borg's JSON **unchanged**: `{ meta, entries }`, where `meta` echoes the filters and reports `entries` and `truncated`. It does not rename, filter, classify, or add fields, and it does not validate the shape beyond requiring a JSON object or array, so a future Borg format change reaches the frontend as-is instead of failing with `502`. Check `meta.truncated` before treating a period as complete.
 
 | Query field | Validation/default |
 | --- | --- |
 | `targetEntity` | Required: `agritehnica`, `green`, or `babyhub` |
 | `from`, `to` | Required, real `YYYY-MM-DD` dates; `from <= to` |
-| `gestiune` | Optional positive safe integer warehouse ID |
-| `docType` | Optional `BFD`, `AIM`, or `AIMS`; upstream must support the requested type |
+| `docType` | Optional document type (`tipDocument`), 1–10 letters or digits, for example `FF`, `EC`, `FFA`, `AIMR`; case-insensitive, any code Borg knows |
+| `account` | Optional account code or prefix, 1–32 letters, digits, `.`, `_`, `-`; Borg matches it against the debit **or** credit account (`401` also matches `401.G`) |
 | `limit` | Integer 1–50000; default 5000 |
-| `includeTransfers` | Literal `true` or `false`; default `false` |
 
-The interval may include **at most 30 calendar days, counting both endpoints**, and must stay in one calendar year. September 1–30 is valid; August 1–31 is not. Ranges can cross month boundaries within the same year if they still fit within 30 days. Split longer ranges into non-overlapping requests. Invalid, repeated, or unknown query parameters return `400` before contacting Borg.
+`gestiune`, `includeTransfers`, `revenueGroupId`, and `responseFormat` were removed. Borg ignores `gestiune` and `includeTransfers` now, so accepting them would silently return unfiltered data; they return `400` like any unknown parameter. Filter by `gestiuneId` in the frontend if needed.
 
-Sales lines are classified by the saved revenue rules and filtered to the caller's allowed groups. BORG's authoritative product amounts and signed returns pass through unchanged. Discounts allocated across multiple revenue groups become one row per group, preserving their total value and applying access filtering to each share. There is no sales aggregation or sales-line database storage. Use `responseFormat=grouped` for explicit truncation metadata; array length after access filtering does not reliably indicate completeness. Requests are not automatically retried or paginated, and responses have `Cache-Control: no-store`.
+The interval may include **at most 30 calendar days, counting both endpoints**, and must stay in one calendar year. September 1–30 is valid; August 1–31 is not. Ranges can cross month boundaries within the same year if they still fit within 30 days. Split longer ranges into non-overlapping requests. Invalid, repeated, or unknown query parameters return `400` before contacting Borg. A full 30-day request for Agritehnica can exceed 15 MB. Requests are not automatically retried or paginated, and responses have `Cache-Control: no-store`.
+
+Ledger entries carry no product category, so they cannot be split by revenue group. Roles scoped to specific groups (`salesGroups` other than `null`) receive `403` on this endpoint rather than seeing every entry. Only roles with access to all groups can read it.
 
 The upstream call times out after 30 seconds (`504`) and does not follow redirects. An upstream `400` becomes a sanitized `400`; throttling or temporary unavailability becomes `503`; other upstream HTTP, connection, or malformed-response failures become `502`. Upstream error bodies and credentials are never returned to the frontend. `401`/`403` from Borg become `502` because they indicate a backend integration problem, not a failed Microsoft login.
 
@@ -303,16 +305,16 @@ only those IDs; `[]` grants no sales. Role creation accepts this field (default
 `PATCH /api/roles/:name/sales-groups` with `{ "salesGroups": ["utilaje"] }`.
 Built-in role scopes cannot be changed through this endpoint.
 
-Sales requires `sales:read`, the user's entity grant, and an allowed revenue group.
-Selected groups apply across granted entities where grouping is enabled. Entities
-without grouping require `salesGroups: null`. Scope does not grant entities and
-does not change stock/support permissions. Changes take effect on the next request.
+`GET /api/borg/sales` requires `sales:read`, the user's entity grant, and
+`salesGroups: null`. Borg's ledger entries have no category, so group-scoped roles are
+denied (see Borg sales above). Scope does not grant entities and does not change
+stock/support permissions. Changes take effect on the next request.
 
 The schema upgrade sets existing roles to unrestricted group access once, preserving
 their current access. Subsequent schema runs keep saved restrictions. New database
 role rows default to `[]`; trusted operators must explicitly select a scope.
 
-### Sales response
+### Revenue group metadata
 
 `GET /api/revenue-groups?targetEntity=...` requires sales/entity access and returns
 only the caller's allowed `{ groups, accessVersion }`. It returns `403` when no
@@ -320,65 +322,10 @@ groups are allowed, or `groups: []` for an unrestricted role on an ungrouped ent
 The version binds identity, role, permissions, entity grants, group grants, entity,
 and configuration revision.
 
-`GET /api/borg/sales` also accepts:
-
-- `revenueGroupId`: an optional allowed group to narrow results; forbidden IDs
-  return `403`, unknown IDs return `400`.
-- `responseFormat=grouped`: returns `{ lines, possiblyTruncated, accessVersion }`.
-
-Lines include server-owned `revenueGroupId` and `revenueGroupName`, both null when
-grouping is disabled. Without the format option, the legacy array shape remains,
-with these additional fields. All formats also include `businessValueKind`
-(`sale`, `discount`, `special`, or `unclassified`).
-Every response format enforces the same scope.
-The backend requests BORG's envelope internally and uses `meta.truncated` before
-filtering. An older BORG array response falls back to comparing its length with
-the requested limit. BORG's document totals, controls, and warnings are not
-returned by AGS. No hidden group
-counts or totals are exposed. Clients should use the grouped format and compare
-access versions across chunks/comparison periods.
-
-### Separate sales and discounts
-
-For Piese data rows, request:
-
-```text
-/api/borg/sales?targetEntity=agritehnica&from=2026-09-01&to=2026-09-30&limit=50000&includeTransfers=false&revenueGroupId=piese
-```
-
-The response is a plain array of authorized rows, with BORG's product amounts
-and discount allocations.
-The sales API does not return summaries, aggregate totals, or counts.
-`responseFormat=grouped` keeps the same rows with only access and truncation
-metadata (`lines`, `possiblyTruncated`, `accessVersion`), as used by the frontend
-loader. `responseFormat=prepared` is not supported.
-
-Use each row's `businessValueKind` to distinguish product sales, discounts,
-special/service lines, and unknown types. Any dashboard aggregation belongs in the
-frontend. Preserve signed product returns and positive discount reversals.
-Keep special and unclassified amounts separate from product sales and discounts. When using the
-grouped format, respect `possiblyTruncated` before presenting a whole-period total.
-
-With BORG 2.1, `tipLinie` is authoritative: `produs` maps to `sale`,
-`discount` to `discount`, and `special` to `special`. An explicit null or unknown
-type maps to `unclassified`. For old responses without `tipLinie`, Agritehnica
-uses the legacy `~111`, `PT CLIENTI 709`, and `DCH` code mapping and treats other
-`Discount` category rows as unclassified. BORG already corrects line discounts
-and sets `discountInclusInLinii` entries to zero; AGS does not discount them again.
-
-`alocareDiscount.grupe[].grupa` is mapped using the saved revenue rules.
-Shares assigned to the same revenue group are combined. A discount spanning
-multiple groups gets distinct `miscareId` values such as `77:discount:piese`,
-`sourceMiscareId: 77`, and `discountAllocation: true`. Each row carries only its
-group's allocation; its monetary fields are divided consistently, preserving
-the original totals. These allocation rows use quantity 1 and their allocated
-amount as unit price. Standalone `sursa: "nealocat"` discounts retain category
-grouping until their business/warehouse attribution rules are configured.
-No client exclusion is applied automatically.
-
-Revenue group IDs represent configured category groups. The supplied Piese
-report uses warehouse and document scope, which can cross these category groups.
-Reproducing that report is a separate filter from `revenueGroupId=piese`.
+The grouping rules, `businessValueKind` classification, and discount allocation
+code (`classifySales`, `prepareSales`) were built for Borg's former product-line
+format (`grupa`, `tipLinie`, `alocareDiscount`). `/api/borg/sales` no longer calls
+them, because the ledger format has none of those fields.
 
 Deploy this backend before the updated frontend. Startup applies the idempotent
 schema upgrade; no separate production migration command is required.
